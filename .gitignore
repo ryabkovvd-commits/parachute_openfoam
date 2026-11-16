@@ -1,0 +1,9 @@
+/run/
+/case/
+/out/
+/fields/
+/pics/
+*.out
+__pycache__/
+*.py[cod]
+.venv/

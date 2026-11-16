@@ -1,0 +1,91 @@
+cordDrag
+{
+    type vectorCodedSource;
+    selectionMode all;
+    fields (U);
+    name cordDrag;
+    codeInclude
+    #{
+        #include "IFstream.H"
+        #include "OFstream.H"
+    #};
+    codeCorrect #{ #};
+    codeConstrain #{ #};
+    codeAddSup
+    #{
+        const fvMesh& m = mesh_;
+        const fileName root(m.time().rootPath()/m.time().globalCaseName());
+        const label n = CORD_SAMPLES;
+        static labelList cell;
+        static vectorField tangent;
+        static scalarField weight;
+        if (cell.empty())
+        {
+            IFstream stream(root/"constant"/"cords");
+            const vectorField ends(stream);
+            const label count = ends.size()/2;
+            if (count == 0 || ends.size() != 2*count)
+            {
+                FatalErrorInFunction << "Expected a nonempty list of cord endpoint pairs"
+                    << exit(FatalError);
+            }
+            cell.setSize(count*n, -1);
+            tangent.setSize(count);
+            weight.setSize(count);
+            const label me = Pstream::myProcNo();
+            labelList owner(count*n, Pstream::nProcs());
+            forAll(tangent, j)
+            {
+                const vector delta = ends[2*j + 1] - ends[2*j];
+                const scalar length = mag(delta);
+                tangent[j] = delta/length;
+                weight[j] = 0.5*CORD_CD*CORD_WIDTH*length/n;
+                for (label i = 0; i < n; ++i)
+                {
+                    const label k = j*n + i;
+                    cell[k] = m.findCell(ends[2*j] + ((i + 0.5)/n)*delta);
+                    if (cell[k] >= 0) owner[k] = me;
+                }
+            }
+            Pstream::listCombineReduce(owner, minEqOp<label>());
+            forAll(cell, k)
+            {
+                if (owner[k] == Pstream::nProcs())
+                {
+                    FatalErrorInFunction << "Cord sample outside fluid: " << k
+                        << exit(FatalError);
+                }
+                if (owner[k] != me) cell[k] = -1;
+            }
+            Info<< "cordDrag: mapped " << count*n << " samples" << endl;
+        }
+
+        const volVectorField& U = m.lookupObject<volVectorField>("U");
+        vectorField& rhs = eqn.source();
+        const bool output = m.time().writeTime();
+        autoPtr<OFstream> forces;
+        if (output)
+        {
+            const fileName dir(root/"postProcessing"/"cords"/m.time().timeName());
+            mkDir(dir);
+            forces.reset(new OFstream(dir/(Foam::name(Pstream::myProcNo()) + ".dat")));
+            forces().precision(12);
+        }
+        forAll(cell, k)
+        {
+            const label c = cell[k];
+            if (c < 0) continue;
+            const label j = k/n;
+            const vector u = U[c];
+            const vector crossflow = u - (u & tangent[j])*tangent[j];
+            const vector reaction = weight[j]*mag(crossflow)*crossflow;
+            // The source matrix is on the RHS of UEqn; its source is subtracted.
+            rhs[c] += reaction;
+            if (output)
+            {
+                forces() << k << ' ' << reaction.x() << ' ' << reaction.y()
+                         << ' ' << reaction.z() << nl;
+            }
+        }
+    #};
+}

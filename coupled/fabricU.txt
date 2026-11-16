@@ -1,0 +1,73 @@
+const fvPatch& me = this->patch();
+const bool master = (me.name() == "canopy");
+const label other = me.boundaryMesh().findPatchID(master ? "canopy_slave" : "canopy");
+const fvPatch& them = me.boundaryMesh()[other];
+const volScalarField& p = this->db().lookupObject<volScalarField>("p");
+const scalarField pMe(p.boundaryField()[me.index()].patchInternalField());
+const scalarField pThem(p.boundaryField()[other].patchInternalField());
+const scalar Dc = FAB_D, Cw = FAB_CW, lambda = FAB_RELAX;
+static labelList pair;
+static scalar worst = 0;
+if (pair.size() != me.size())
+{
+    pair.setSize(me.size(), -1);
+    const vectorField cMe(me.Cf()), cThem(them.Cf());
+    worst = 0;
+    forAll(cMe, i)
+    {
+        scalar best = GREAT;
+        forAll(cThem, j)
+        {
+            const scalar d = magSqr(cThem[j] - cMe[i]);
+            if (d < best) { best = d; pair[i] = j; }
+        }
+        worst = max(worst, Foam::sqrt(best));
+        if (best > 1e-8) pair[i] = -1;
+    }
+}
+static scalarField Un;
+static label stamp = -1;
+if (Un.size() != me.size()) Un.setSize(me.size(), 0.0);
+const label now = this->db().time().timeIndex();
+if (now != stamp)
+{
+    stamp = now;
+    scalarField dp(me.size(), 0.0);
+    forAll(Un, i)
+    {
+        if (pair[i] < 0) continue;
+        dp[i] = master ? pMe[i] - pThem[pair[i]] : pThem[pair[i]] - pMe[i];
+        scalar target = dp[i]/Dc;
+        if (Cw > SMALL) target = sign(dp[i])*(Foam::sqrt(sqr(Dc) + 4*Cw*mag(dp[i])) - Dc)/(2*Cw);
+        Un[i] += lambda*(target - Un[i]);
+    }
+    if (master && now % 50 == 0)
+    {
+        Info<< "fabricWall: time " << this->db().time().timeName()
+            << " mean dp " << gAverage(dp) << " mean Un " << gAverage(Un)
+            << " max|Un| " << gMax(mag(Un)) << " flux " << gSum(Un*me.magSf())
+            << " pairGap " << returnReduce(worst, maxOp<scalar>()) << endl;
+    }
+}
+const vectorField nf(me.nf());
+const vectorField Uc(this->patchInternalField());
+vectorField Ub((master ? 1.0 : -1.0)*Un*nf);
+forAll(Ub, i)
+{
+    if ((Ub[i] & nf[i]) > 0) Ub[i] += Uc[i] - (Uc[i] & nf[i])*nf[i];
+}
+const scalar kt = FAB_TAN;
+if (kt > 0)
+{
+    const volVectorField& U = this->db().lookupObject<volVectorField>("U");
+    const vectorField Us(U.boundaryField()[other].patchInternalField());
+    forAll(Ub, i)
+    {
+        if ((Ub[i] & nf[i]) < 0 && pair[i] >= 0)
+        {
+            const vector& u = Us[pair[i]];
+            Ub[i] += kt*(u - (u & nf[i])*nf[i]);
+        }
+    }
+}
+operator==(Ub);
