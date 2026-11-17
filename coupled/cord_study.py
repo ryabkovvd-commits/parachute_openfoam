@@ -45,6 +45,24 @@ def save_rows(path, header, rows):
         writer.writerows(rows)
 
 
+def plot_confluence_loads(path, steps, rows, angle):
+    by_pass = {row[0]: row[-2:] for row in rows}
+    node_load, max_tension = np.array([by_pass.get(step, (np.nan, np.nan)) for step in steps]).T
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True, constrained_layout=True)
+    for ax, values, title, color in (
+        (axes[0], node_load, "Равнодействующая на общем узле", "#066f93"),
+        (axes[1], max_tension, "Максимальное натяжение одной стропы", "#a25418"),
+    ):
+        ax.plot(steps, values, "o-", color=color)
+        ax.set(title=title, ylabel="Сила, Н", ylim=(0, None))
+        ax.grid(alpha=0.23)
+    axes[-1].set(xlabel="Номер прохода", xticks=steps)
+    if angle is not None:
+        fig.suptitle(f"Нагрузки при α = {angle:g}°")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def confluence_loads(work, name, records, output):
     """Recover elastic suspension loads on the common node from saved shapes."""
     if not records:
@@ -76,11 +94,14 @@ def confluence_loads(work, name, records, output):
 
     output.mkdir(parents=True, exist_ok=True)
     table = output / "confluence_loads.csv"
+    plot = output / "confluence_loads.png"
     save_rows(table, ("pass", "Fx_N", "Fy_N", "Fz_N", "node_load_N", "max_cord_N"), rows)
+    plot_confluence_loads(plot, sorted(record["pass"] for record in records), rows, config.get("hold"))
     print("pass  node_load_N  max_cord_N")
     for step, _, _, _, load, maximum in rows:
         print(f"{step:4d}  {load:11.1f}  {maximum:10.1f}")
     print(table)
+    print(plot)
 
 
 def plot_motion(initial, final, anchor, junctions, output):
