@@ -1,16 +1,17 @@
 """Картинки по посчитанному случаю связки -- без ParaView, только matplotlib.
 
-    python plots.py ИМЯ [--run=ПАПКА] [--pass=N] [--out=...] [--fields=...] [--V=...]
+    python plots.py ИМЯ [--run=ПАПКА] [--pass=N] [--out=...] [--fields=...] [--V=...] [--wake=0|1]
 
 ПАПКА -- где лежат out/ и fields/ (на кластере run/cc, run/s1, run/mks3 ...;
 по умолчанию текущая).  Проход -- последний сохранённый, если не задан.
 Скорость потока берётся из журнала (строка «V = ... м/с»), иначе 9 м/с.
 
 Пишет в ПАПКА/pics/:
-    ИМЯ_история.png      c_x, c_y, m_z, Dp/D0 и невязка по проходам
+    ИМЯ_история.png      c_x, c_y, m_z и Dp/D0 по проходам
     ИМЯ_купол.png        перепад ΔCp по куполу, три вида
-    ИМЯ_сечение.png      скорость и давление в плоскости через ось купола
-    ИМЯ_линии_тока.png   линии тока в той же плоскости
+    ИМЯ_давление.png     поле Cp в плоскости через ось купола
+    ИМЯ_скорость.png     поле |U|/V в той же плоскости
+    ИМЯ_линии_тока.png   проекция линий тока, включая след для nos6_held
     ИМЯ_форма.png        форма по проходам, проекция на плоскость наклона
 Поток идёт снизу вверх (+z), коуш в нуле, наклон -- в плоскости xz.
 """
@@ -18,6 +19,9 @@ import json
 import re
 import sys
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 
 import matplotlib
 matplotlib.use("Agg")
@@ -58,6 +62,8 @@ KIN = 0.5 * V**2
 passes = sorted(FIELDS.glob("pass*"))
 FACES = None   # грани сетки на месте ткани -- «настоящий» купол, из surfacePressure
 PASS = FIELDS / f"pass{int(FLAG['--pass']):02d}" if "--pass" in FLAG else (passes[-1] if passes else None)
+story = OUT / f"{NAME}.json"
+HISTORY = json.loads(story.read_text(encoding="utf-8")) if story.is_file() else []
 
 
 def last(folder):
@@ -88,18 +94,18 @@ def save(fig, suffix):
 
 
 def history():
-    story = OUT / f"{NAME}.json"
-    if not story.exists():
+    if not HISTORY:
         return
-    rows = json.loads(story.read_text(encoding="utf-8"))
-    n = [r["pass"] for r in rows]
+    n = np.array([int(r["pass"]) for r in HISTORY])
+    ticks = n[np.linspace(0, len(n) - 1, min(6, len(n)), dtype=int)]
     fig, axes = plt.subplots(1, 4, figsize=(14, 3.2))
     for ax, key, label in zip(axes, ("cx", "cy", "mz", "ratio"), ("c_x", "c_y", "m_z", "Dp/D0")):
-        ax.plot(n, [r[key] for r in rows], "o-", color="#3b6ea8", ms=4)
+        ax.plot(n, [r[key] for r in HISTORY], "o-", color="#3b6ea8", ms=4)
         ax.set_title(label)
         ax.set_xlabel("проход")
+        ax.set_xticks(ticks)
         ax.grid(alpha=0.3)
-    fig.suptitle(f"{NAME}: по проходам")
+    fig.suptitle("Сходимость параметров")
     fig.tight_layout()
     save(fig, "история")
 
@@ -121,9 +127,7 @@ def canopy_pressure():
     norm = TwoSlopeNorm(vcenter=0.0, vmin=-0.5, vmax=3.0)
     cmap = plt.get_cmap("RdBu_r")
     mid, span = centre.mean(axis=0), np.ptp(centre, axis=0).max() * 0.6
-    for k, (elev, azim, title) in enumerate(((5, -90, "сбоку (плоскость наклона)"),
-                                             (90, -90, "по оси потока, с подветренной стороны"),
-                                             (35, -60, "наискось"))):
+    for k, (elev, azim) in enumerate(((5, -90), (90, -90), (35, -60))):
         ax = fig.add_subplot(1, 3, k + 1, projection="3d")
         if faces is not None:
             ax.add_collection3d(Poly3DCollection(faces, facecolors=cmap(norm(dcp)),
@@ -135,12 +139,10 @@ def canopy_pressure():
         ax.set_box_aspect((1, 1, 1), zoom=1.45)
         ax.view_init(elev=elev, azim=azim)
         ax.set_axis_off()
-        ax.set_title(title)
     bar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=fig.axes, shrink=0.7)
     bar.set_label("ΔCp = (p_наветр − p_подветр) / (ρV²/2)")
     side = centre[:, 0] > centre[:, 0].mean()
-    fig.suptitle(f"{NAME}, {PASS.name}, итерация/время {step.name}: перепад по куполу, "
-                 f"средний ΔCp = {dcp.mean():.3f}, x+ {dcp[side].mean():.3f}, x- {dcp[~side].mean():.3f}")
+    fig.suptitle("Перепад давления на куполе")
     save(fig, "купол")
     if faces is not None:
         force = dcp[:, None] * area[:, None] * unit
@@ -198,6 +200,22 @@ def trace(ax, centre):
         ax.plot(centre[near, 0], centre[near, 2], ".", color="k", ms=1.5)
 
 
+def attack_angle_label():
+    if PASS is not None:
+        number = int(PASS.name.removeprefix("pass"))
+        for row in HISTORY:
+            if int(row["pass"]) == number:
+                if row.get("hold") is not None:
+                    return f" при α={float(row['hold']):g}°"
+                if row.get("tilt") is not None and row.get("dtilt") is not None:
+                    angle = float(row["tilt"]) - float(row["dtilt"])
+                    return f" при α={angle:g}°"
+                break
+    match = re.search(r"(?:^|_)a(-?\d+(?:\.\d+)?)$", RUN.name) or re.search(
+        r"(?:^|_)a(-?\d+(?:\.\d+)?)$", NAME)
+    return f" при α={float(match[1]):g}°" if match else ""
+
+
 def section(centre):
     step = last(PASS / "postProcessing" / "cut") if PASS else None
     if step is None:
@@ -211,32 +229,139 @@ def section(centre):
     print(f"сечение {NAME}: вдали перед куполом Cp {cp[far].mean():.3f} Cp0 {total[far].mean():.3f},"
           f" наибольшие Cp {cp.max():.3f} Cp0 {total.max():.3f}")
     k = cp.argmax()
-    print(f"наибольший Cp в точке x {pts[k, 0]:.2f} z {pts[k, 2]:.2f}, |U|/V там {speed[k]:.2f}; купол x {centre[:, 0].min():.2f}"
-          f" .. {centre[:, 0].max():.2f} z {centre[:, 2].min():.2f} .. {centre[:, 2].max():.2f}")
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6.5))
-    for ax, val, cmap, label, norm in (
-            (axes[0], speed, "viridis", "|U| / V", None),
-            (axes[1], cp, "RdBu_r", "Cp = p / (ρV²/2)", TwoSlopeNorm(0.0, vmin=min(cp.min(), -1), vmax=max(cp.max(), 1)))):
+    print(f"наибольший Cp в точке x {pts[k, 0]:.2f} z {pts[k, 2]:.2f}, |U|/V там {speed[k]:.2f}")
+    angle = attack_angle_label()
+    for suffix, title, val, cmap, label, norm in (
+            ("скорость", "Распределение скорости", speed, "viridis", "|U| / V", None),
+            ("давление", "Распределение давления", cp, "RdBu_r", "Cp = p / (ρV²/2)",
+             TwoSlopeNorm(0.0, vmin=min(cp.min(), -1), vmax=max(cp.max(), 1)))):
+        fig, ax = plt.subplots(figsize=(7, 7))
         art = ax.tripcolor(tri, val, cmap=cmap, norm=norm, shading="gouraud")
         trace(ax, centre)
         if centre is not None:
             window(ax, centre)
         ax.set_aspect("equal")
         ax.set_xlabel("x, м")
-        ax.set_ylabel("z, м (поток вверх)")
+        ax.set_ylabel("z, м")
+        ax.set_title(title + angle)
         fig.colorbar(art, ax=ax, shrink=0.8, label=label)
-    fig.suptitle(f"{NAME}, {PASS.name}, {step.name}: сечение y = 0")
-    fig.tight_layout()
-    save(fig, "сечение")
+        fig.tight_layout()
+        save(fig, suffix)
+    (PICS / f"{NAME}_сечение.png").unlink(missing_ok=True)
+
+
+def fabric_wake_seeds(step, width):
+    master, slave = step / "master.vtp", step / "slave.vtp"
+    if not master.is_file() or not slave.is_file():
+        return ""
+    centre, area, normal, pm = vtp.faces_of(master)
+    other, _, _, ps = vtp.faces_of(slave)
+    mate = vtp.nearest(centre, other)
+    paired = np.linalg.norm(centre - other[mate], axis=1) <= 1e-4
+    near_section = np.abs(centre[:, 1]) <= 0.65 * np.sqrt(area)
+    eligible = np.flatnonzero(paired & near_section & (pm > ps[mate]) & (area > 0))
+    chosen = []
+    xz = centre[:, [0, 2]]
+    for i in eligible[np.argsort(centre[eligible, 0])]:
+        if all(np.linalg.norm(xz[i] - xz[j]) >= width / 16 for j in chosen):
+            chosen.append(i)
+    if not chosen:
+        return ""
+    # Нормаль master направлена в сторону slave, куда выходит воздух при Δp > 0.
+    seeds = centre[chosen] + 0.2 * np.sqrt(area[chosen])[:, None] * normal[chosen]
+    points = " ".join("(" + " ".join(f"{v:.9g}" for v in point) + ")" for point in seeds)
+    return f"""
+    fabricWake
+    {{
+        type streamLine; libs (fieldFunctionObjects); cloud fabricWakeTracks;
+        writeControl writeTime; setFormat vtk; fields (U); U U;
+        direction forward; lifeTime 12000; nSubCycle 5;
+        seedSampleSet {{ type cloud; axis xyz; points ({points}); }}
+    }}
+"""
+
+
+def wake_tracks(centre):
+    """Сохранённое поле U и сетка одного прохода во временном кейсе OpenFOAM."""
+    tool = shutil.which("simpleFoam")
+    step = last(PASS / "postProcessing" / "surfacePressure")
+    case = RUN / "case"
+    if tool is None or step is None or not (PASS / "polyMesh").is_dir() or not (PASS / step.name / "U").is_file():
+        print("след: нужны simpleFoam, polyMesh и U того же прохода, что и surfacePressure")
+        return [], None
+
+    points = np.concatenate(FACES, axis=0) if FACES is not None else centre
+    lo, hi = points.min(axis=0), points.max(axis=0)
+    width = hi[0] - lo[0]
+    start, end, z = lo[0] - 0.12 * width, hi[0] + 0.12 * width, hi[2] + 0.04 * width
+    fabric_seeds = fabric_wake_seeds(step, width)
+    log = PICS / f"{NAME}_{PASS.name}_след.log"
+    try:
+        with tempfile.TemporaryDirectory(prefix="nos6_wake_") as tmp:
+            work = Path(tmp)
+            (work / "system").mkdir()
+            (work / "constant").mkdir()
+            (work / step.name).mkdir()
+            shutil.copytree(PASS / "polyMesh", work / "constant" / "polyMesh")
+            for name in ("U", "p", "phi", "k", "omega", "nut"):
+                value = PASS / step.name / name
+                if value.is_file():
+                    shutil.copy2(value, work / step.name / name)
+            for name in ("system/fvSchemes", "system/fvSolution", "constant/transportProperties",
+                         "constant/turbulenceProperties"):
+                shutil.copy2(case / name, work / name)
+            (work / "system" / "controlDict").write_text(f"""
+FoamFile {{ version 2.0; format ascii; class dictionary; object controlDict; }}
+application simpleFoam;
+startFrom startTime; startTime 0; stopAt endTime; endTime {step.name}; deltaT 1;
+writeControl timeStep; writeInterval 1; writeFormat binary;
+functions
+{{
+    wake
+    {{
+        type streamLine; libs (fieldFunctionObjects); cloud wakeTracks;
+        writeControl writeTime; setFormat vtk; fields (U); U U;
+        direction forward; lifeTime 12000; nSubCycle 5;
+        seedSampleSet
+        {{
+            type uniform; axis x; nPoints 45;
+            start ({start:.9g} 0 {z:.9g}); end ({end:.9g} 0 {z:.9g});
+        }}
+    }}
+    {fabric_seeds}
+}}
+""", encoding="ascii")
+            with log.open("w", encoding="utf-8") as stream:
+                subprocess.run([tool, "-postProcess", "-case", str(work), "-time", step.name],
+                               stdout=stream, stderr=subprocess.STDOUT, check=True, timeout=180)
+            sets = work / "postProcessing" / "sets"
+            paths = [(kind, path) for kind in ("wake", "fabricWake")
+                     for path in sorted((sets / kind).rglob("*.vtp"))]
+            if not paths:
+                print(f"след: OpenFOAM не записал траектории, см. {log}")
+                return [], None
+            files = []
+            for kind, path in paths:
+                label = "след" if kind == "wake" else "выход_из_ткани"
+                output = PICS / f"{NAME}_{PASS.name}_{label}_{path.name}"
+                shutil.copy2(path, output)
+                files.append(output)
+            return files, (start, end, z)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"след: {error}, см. {log}")
+        return [], None
 
 
 def streamlines(centre):
     step = last(PASS / "postProcessing" / "sets" / "streamlines") if PASS else None
     files = sorted(step.glob("*.vtp")) if step else []
-    if not files:
+    draw_wake = FLAG.get("--wake", "1" if NAME == "nos6_held" else "0") == "1"
+    wake_files, seed = wake_tracks(centre) if draw_wake and centre is not None else ([], None)
+    if not files and not wake_files:
         return
     fig, ax = plt.subplots(figsize=(7, 9))
-    for f in files:
+    flow = None
+    for f in files + wake_files:
         got = vtp.arrays(f)
         pts = np.asarray(got["Points"], dtype=float)
         conn, offs = np.asarray(got["connectivity"]), np.asarray(got["offsets"])
@@ -247,25 +372,32 @@ def streamlines(centre):
             xz = pts[idx][:, [0, 2]]
             segs += list(np.stack([xz[:-1], xz[1:]], axis=1))
             vals += list(0.5 * (speed[idx][:-1] + speed[idx][1:]))
-        ax.add_collection(LineCollection(segs, array=np.array(vals), cmap="viridis", linewidths=0.8,
-                                         norm=plt.Normalize(0, 1.5)))
+        if segs:
+            flow = LineCollection(segs, array=np.array(vals), cmap="viridis", linewidths=0.8,
+                                  norm=plt.Normalize(0, 1.5))
+            ax.add_collection(flow)
         ax.autoscale_view()
     trace(ax, centre)
+    if seed is not None:
+        a, b, z = seed
+        ax.plot((a, b), (z, z), "--", color="0.45", lw=0.7, label="Запуск линий в следе")
+        ax.legend(frameon=False, loc="upper right", fontsize=8)
     if centre is not None:
         window(ax, centre)
     ax.set_aspect("equal")
     ax.set_xlabel("x, м")
-    ax.set_ylabel("z, м (поток вверх)")
-    ax.set_title(f"{NAME}, {PASS.name}, {step.name}: линии тока, цвет |U|/V")
+    ax.set_ylabel("z, м")
+    ax.set_title("Линии тока")
+    if flow is not None:
+        fig.colorbar(flow, ax=ax, shrink=0.8, label="|U| / V")
     save(fig, "линии_тока")
 
 
 def shapes():
     frames = sorted((OUT / "кадры").glob(f"{NAME}_проход*.npy"))
-    story = OUT / f"{NAME}.json"
-    if not frames or not story.exists():
+    if not frames or not HISTORY:
         return
-    first = json.loads(story.read_text(encoding="utf-8"))[0]
+    first = HISTORY[0]
     g, r = first["gores"], first["rings"]
     fig, ax = plt.subplots(figsize=(7, 7))
     colors = plt.get_cmap("Blues")(np.linspace(0.35, 1.0, len(frames)))
@@ -275,14 +407,12 @@ def shapes():
         # два меридиана в плоскости наклона (0° и 180°) -- профиль купола
         prof = np.vstack([grid[::-1, g // 2], grid[:, 0]])
         ax.plot(prof[:, 0], prof[:, 2], "-", color=c, lw=1.5, label=f.stem.split("_")[-1])
-        skirt = grid[r]
-        ax.plot(skirt[:, 0], skirt[:, 2], ".", color=c, ms=1)
     ax.set_aspect("equal")
     ax.set_xlabel("x, м")
-    ax.set_ylabel("z, м (поток вверх)")
+    ax.set_ylabel("z, м")
+    ax.set_title("Изменение профиля купола")
     ax.grid(alpha=0.3)
     ax.legend(frameon=False, fontsize=8)
-    ax.set_title(f"{NAME}: профиль купола по проходам (плоскость наклона)")
     save(fig, "форма")
 
 history()
