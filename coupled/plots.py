@@ -250,51 +250,77 @@ def section(centre):
     (PICS / f"{NAME}_сечение.png").unlink(missing_ok=True)
 
 
-def fabric_wake_seeds(step, width):
+def read_tracks(files):
+    tracks = []
+    for path in files:
+        data = vtp.arrays(path)
+        points = np.asarray(data["Points"], dtype=float)
+        speed = np.linalg.norm(np.asarray(data["U"]).reshape(-1, 3), axis=1) / V
+        conn, offsets = np.asarray(data["connectivity"]), np.asarray(data["offsets"])
+        for start, end in zip(np.r_[0, offsets[:-1]], offsets):
+            idx = conn[start:end]
+            if len(idx) > 1:
+                tracks.append((points[idx], speed[idx]))
+    return tracks
+
+
+def hit_triangle(point, triangles, lo, hi, tol):
+    ids = np.flatnonzero(np.all((lo - tol <= point) & (point <= hi + tol), axis=1))
+    if not len(ids):
+        return None
+    a, b, c = triangles[ids].transpose(1, 0, 2)
+    n = np.cross(b - a, c - a)
+    norm = np.linalg.norm(n, axis=1)
+    keep = norm > 0
+    ids, a, b, c, n = ids[keep], a[keep], b[keep], c[keep], n[keep] / norm[keep, None]
+    distance = np.abs(np.sum((point - a) * n, axis=1))
+    inside = distance <= tol
+    for v, w in ((a, b), (b, c), (c, a)):
+        edge = w - v
+        inside &= np.sum(np.cross(edge, point - v) * n, axis=1) >= -tol * np.linalg.norm(edge, axis=1)
+    hits = np.flatnonzero(inside)
+    return ids[hits[np.argmin(distance[hits])]] if len(hits) else None
+
+
+def fabric_transfers(step, tracks):
     master, slave = step / "master.vtp", step / "slave.vtp"
     if not master.is_file() or not slave.is_file():
-        return ""
+        return {}, 0.0
+    points, cells, _ = polys(master)
     centre, area, normal, pm = vtp.faces_of(master)
     other, _, _, ps = vtp.faces_of(slave)
     mate = vtp.nearest(centre, other)
-    paired = np.linalg.norm(centre - other[mate], axis=1) <= 1e-4
-    near_section = np.abs(centre[:, 1]) <= 0.65 * np.sqrt(area)
-    eligible = np.flatnonzero(paired & near_section & (pm > ps[mate]) & (area > 0))
-    chosen = []
-    xz = centre[:, [0, 2]]
-    for i in eligible[np.argsort(centre[eligible, 0])]:
-        if all(np.linalg.norm(xz[i] - xz[j]) >= width / 16 for j in chosen):
-            chosen.append(i)
-    if not chosen:
-        return ""
-    # Нормаль master направлена в сторону slave, куда выходит воздух при Δp > 0.
-    seeds = centre[chosen] + 0.2 * np.sqrt(area[chosen])[:, None] * normal[chosen]
-    points = " ".join("(" + " ".join(f"{v:.9g}" for v in point) + ")" for point in seeds)
-    return f"""
-    fabricWake
-    {{
-        type streamLine; libs (fieldFunctionObjects); cloud fabricWakeTracks;
-        writeControl writeTime; setFormat vtk; fields (U); U U;
-        direction forward; lifeTime 12000; nSubCycle 5;
-        seedSampleSet {{ type cloud; axis xyz; points ({points}); }}
-    }}
-"""
+    paired = ((np.linalg.norm(centre - other[mate], axis=1) <= 1e-4)
+              & (vtp.nearest(other, centre)[mate] == np.arange(len(centre))))
+    # Нормаль master направлена в сторону slave. Знак Δp определяет сторону выхода.
+    direction = np.sign(pm - ps[mate])[:, None] * normal
+    triangles = points[fan(cells)]
+    face_ids = np.repeat(np.arange(len(cells)), [len(cell) - 2 for cell in cells])
+    lo, hi = triangles.min(axis=1), triangles.max(axis=1)
+    tol = 1e-5 * max(np.ptp(points, axis=0).max(), 1.0)
+    transfers = {}
+    for i, (path, _) in enumerate(tracks):
+        hit = path[-1]
+        triangle = hit_triangle(hit, triangles, lo, hi, tol)
+        if triangle is None:
+            continue
+        face = face_ids[triangle]
+        previous = np.flatnonzero(np.linalg.norm(path[:-1] - hit, axis=1) > tol)
+        if paired[face] and len(previous) and np.dot(hit - path[previous[-1]], direction[face]) > 0:
+            # Малое смещение помещает начальную точку в ячейку на выходной стороне.
+            offset = max(4 * tol, 0.015 * np.sqrt(area[face]))
+            transfers[i] = hit + offset * direction[face]
+    return transfers, tol
 
 
-def wake_tracks(centre):
-    """Сохранённое поле U и сетка одного прохода во временном кейсе OpenFOAM."""
+def trace_transfers(step, targets):
+    """Трассировка за тканью по сохранённому полю U во временном кейсе."""
     tool = shutil.which("simpleFoam")
-    step = last(PASS / "postProcessing" / "surfacePressure")
     case = RUN / "case"
-    if tool is None or step is None or not (PASS / "polyMesh").is_dir() or not (PASS / step.name / "U").is_file():
+    if tool is None or not (PASS / "polyMesh").is_dir() or not (PASS / step.name / "U").is_file():
         print("след: нужны simpleFoam, polyMesh и U того же прохода, что и surfacePressure")
         return []
-
-    points = np.concatenate(FACES, axis=0) if FACES is not None else centre
-    lo, hi = points.min(axis=0), points.max(axis=0)
-    width = hi[0] - lo[0]
-    start, end, z = lo[0] - 0.12 * width, hi[0] + 0.12 * width, hi[2] + 0.04 * width
-    fabric_seeds = fabric_wake_seeds(step, width)
+    points = " ".join("(" + " ".join(f"{v:.10g}" for v in point) + ")" for point in targets)
     log = PICS / f"{NAME}_{PASS.name}_след.log"
     try:
         with tempfile.TemporaryDirectory(prefix="nos6_wake_") as tmp:
@@ -317,66 +343,79 @@ startFrom startTime; startTime 0; stopAt endTime; endTime {step.name}; deltaT 1;
 writeControl timeStep; writeInterval 1; writeFormat binary;
 functions
 {{
-    wake
+    continuation
     {{
-        type streamLine; libs (fieldFunctionObjects); cloud wakeTracks;
+        type streamLine; libs (fieldFunctionObjects); cloud continuationTracks;
         writeControl writeTime; setFormat vtk; fields (U); U U;
         direction forward; lifeTime 12000; nSubCycle 5;
-        seedSampleSet
-        {{
-            type uniform; axis x; nPoints 45;
-            start ({start:.9g} 0 {z:.9g}); end ({end:.9g} 0 {z:.9g});
-        }}
+        seedSampleSet {{ type cloud; axis xyz; points ({points}); }}
     }}
-    {fabric_seeds}
 }}
 """, encoding="ascii")
             with log.open("w", encoding="utf-8") as stream:
                 subprocess.run([tool, "-postProcess", "-case", str(work), "-time", step.name],
                                stdout=stream, stderr=subprocess.STDOUT, check=True, timeout=180)
-            sets = work / "postProcessing" / "sets"
-            paths = [(kind, path) for kind in ("wake", "fabricWake")
-                     for path in sorted((sets / kind).rglob("*.vtp"))]
+            paths = sorted((work / "postProcessing" / "sets" / "continuation").rglob("*.vtp"))
             if not paths:
                 print(f"след: OpenFOAM не записал траектории, см. {log}")
                 return []
-            files = []
-            for kind, path in paths:
-                label = "след" if kind == "wake" else "выход_из_ткани"
-                output = PICS / f"{NAME}_{PASS.name}_{label}_{path.name}"
+            for path in paths:
+                output = PICS / f"{NAME}_{PASS.name}_продолжение_{path.name}"
                 shutil.copy2(path, output)
-                files.append(output)
-            return files
+            return read_tracks(paths)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"след: {error}, см. {log}")
         return []
 
 
+def join_transfers(tracks, transfers, continuations, tol):
+    if not continuations:
+        return 0
+    distance = np.linalg.norm(np.asarray(list(transfers.values()))[:, None, :]
+                              - np.asarray([points[0] for points, _ in continuations]), axis=2)
+    incoming = list(transfers)
+    claimed_in, claimed_out = set(), set()
+    for k in np.argsort(distance, axis=None):
+        i, j = np.unravel_index(k, distance.shape)
+        if distance[i, j] > 4 * tol:
+            break
+        if i in claimed_in or j in claimed_out:
+            continue
+        points, speeds = tracks[incoming[i]]
+        tail_points, tail_speeds = continuations[j]
+        tracks[incoming[i]] = (np.vstack((points, tail_points)), np.r_[speeds, tail_speeds])
+        claimed_in.add(i)
+        claimed_out.add(j)
+    return len(claimed_in)
+
+
 def streamlines(centre):
     step = last(PASS / "postProcessing" / "sets" / "streamlines") if PASS else None
-    files = sorted(step.glob("*.vtp")) if step else []
-    draw_wake = FLAG.get("--wake", "1" if NAME == "nos6_held" else "0") == "1"
-    wake_files = wake_tracks(centre) if draw_wake and centre is not None else []
-    if not files and not wake_files:
+    if step is None:
         return
+    tracks = read_tracks(sorted(step.glob("*.vtp")))
+    if not tracks:
+        return
+    draw_wake = FLAG.get("--wake", "1" if NAME == "nos6_held" else "0") == "1"
+    pressure_step = PASS / "postProcessing" / "surfacePressure" / step.name
+    if draw_wake:
+        transfers, tol = fabric_transfers(pressure_step, tracks)
+        if transfers:
+            continuations = trace_transfers(pressure_step, list(transfers.values()))
+            joined = join_transfers(tracks, transfers, continuations, tol)
+            print(f"линии тока: продолжено через ткань {joined} из {len(transfers)}")
+        else:
+            print("линии тока: нет подтверждённых точек пересечения ткани")
     fig, ax = plt.subplots(figsize=(7, 9))
-    flow = None
-    for f in files + wake_files:
-        got = vtp.arrays(f)
-        pts = np.asarray(got["Points"], dtype=float)
-        conn, offs = np.asarray(got["connectivity"]), np.asarray(got["offsets"])
-        speed = np.linalg.norm(np.asarray(got["U"]).reshape(-1, 3), axis=1) / V
-        segs, vals = [], []
-        for a, b in zip(np.concatenate(([0], offs[:-1])), offs):
-            idx = conn[a:b]
-            xz = pts[idx][:, [0, 2]]
-            segs += list(np.stack([xz[:-1], xz[1:]], axis=1))
-            vals += list(0.5 * (speed[idx][:-1] + speed[idx][1:]))
-        if segs:
-            flow = LineCollection(segs, array=np.array(vals), cmap="viridis", linewidths=0.8,
-                                  norm=plt.Normalize(0, 1.5))
-            ax.add_collection(flow)
-        ax.autoscale_view()
+    segs, vals = [], []
+    for points, speed in tracks:
+        xz = points[:, [0, 2]]
+        segs.append(np.stack([xz[:-1], xz[1:]], axis=1))
+        vals.append(0.5 * (speed[:-1] + speed[1:]))
+    flow = LineCollection(np.concatenate(segs), array=np.concatenate(vals), cmap="viridis", linewidths=0.8,
+                          norm=plt.Normalize(0, 1.5))
+    ax.add_collection(flow)
+    ax.autoscale_view()
     trace(ax, centre)
     if centre is not None:
         window(ax, centre)
@@ -384,8 +423,7 @@ def streamlines(centre):
     ax.set_xlabel("x, м")
     ax.set_ylabel("z, м")
     ax.set_title("Линии тока")
-    if flow is not None:
-        fig.colorbar(flow, ax=ax, shrink=0.8, label="|U| / V")
+    fig.colorbar(flow, ax=ax, shrink=0.8, label="|U| / V")
     save(fig, "линии_тока")
 
 
