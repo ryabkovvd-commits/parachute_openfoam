@@ -288,7 +288,7 @@ def wake_tracks(centre):
     case = RUN / "case"
     if tool is None or step is None or not (PASS / "polyMesh").is_dir() or not (PASS / step.name / "U").is_file():
         print("след: нужны simpleFoam, polyMesh и U того же прохода, что и surfacePressure")
-        return [], None
+        return []
 
     points = np.concatenate(FACES, axis=0) if FACES is not None else centre
     lo, hi = points.min(axis=0), points.max(axis=0)
@@ -339,24 +339,24 @@ functions
                      for path in sorted((sets / kind).rglob("*.vtp"))]
             if not paths:
                 print(f"след: OpenFOAM не записал траектории, см. {log}")
-                return [], None
+                return []
             files = []
             for kind, path in paths:
                 label = "след" if kind == "wake" else "выход_из_ткани"
                 output = PICS / f"{NAME}_{PASS.name}_{label}_{path.name}"
                 shutil.copy2(path, output)
                 files.append(output)
-            return files, (start, end, z)
+            return files
     except (OSError, subprocess.SubprocessError) as error:
         print(f"след: {error}, см. {log}")
-        return [], None
+        return []
 
 
 def streamlines(centre):
     step = last(PASS / "postProcessing" / "sets" / "streamlines") if PASS else None
     files = sorted(step.glob("*.vtp")) if step else []
     draw_wake = FLAG.get("--wake", "1" if NAME == "nos6_held" else "0") == "1"
-    wake_files, seed = wake_tracks(centre) if draw_wake and centre is not None else ([], None)
+    wake_files = wake_tracks(centre) if draw_wake and centre is not None else []
     if not files and not wake_files:
         return
     fig, ax = plt.subplots(figsize=(7, 9))
@@ -378,10 +378,6 @@ def streamlines(centre):
             ax.add_collection(flow)
         ax.autoscale_view()
     trace(ax, centre)
-    if seed is not None:
-        a, b, z = seed
-        ax.plot((a, b), (z, z), "--", color="0.45", lw=0.7, label="Запуск линий в следе")
-        ax.legend(frameon=False, loc="upper right", fontsize=8)
     if centre is not None:
         window(ax, centre)
     ax.set_aspect("equal")
