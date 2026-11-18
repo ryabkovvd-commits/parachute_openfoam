@@ -459,6 +459,30 @@ def draw_recirculation(ax, tracks):
                         arrowprops=dict(arrowstyle="-|>", color="#122536", lw=0.8, mutation_scale=8), zorder=4)
 
 
+def extend_streamlines(step, tracks, field, shape, *, run_dir, pass_dir, case_name, case_journal):
+    """Достроить исходные линии по другую сторону ткани и рассчитать след."""
+    pressure_step = pass_dir / "postProcessing" / "surfacePressure" / step.name
+    porous = "ВДУВОМ-ОТСОСОМ" in case_journal or "Проницаемая ткань:" in case_journal
+    transfers, tol = fabric_transfers(pressure_step, tracks) if porous else ({}, 0.0)
+    seeds, wake_top = [], None
+    if field is not None and shape is not None:
+        lo, hi = shape.min(axis=0), shape.max(axis=0)
+        width = hi[0] - lo[0]
+        if width > 0:
+            seeds, wake_top = recirculation_seeds(field[0], field[2]["U"].reshape(-1, 3), lo, hi, width)
+    traced = trace_saved_tracks(pressure_step, {
+        "continuation": (list(transfers.values()), "forward"),
+        "recirculation": (seeds, "bidirectional"),
+    }, run_dir=run_dir, pass_dir=pass_dir, case_name=case_name)
+    wake = traced.get("recirculation", [])
+    if len(seeds):
+        print(f"след: {len(seeds)} начальных точек, {len(wake)} траекторий")
+    if porous:
+        joined = join_transfers(tracks, transfers, traced.get("continuation", []), tol) if transfers else 0
+        print(f"{case_name} {pass_dir.name}: продолжено через ткань {joined} из {len(transfers)}")
+    return wake, wake_top
+
+
 def streamlines(centre):
     step = last(PASS / "postProcessing" / "sets" / "streamlines") if PASS else None
     if step is None:
@@ -469,7 +493,6 @@ def streamlines(centre):
     cut_file = PASS / "postProcessing" / "cut" / step.name / "plane.vtp"
     field = section_field(cut_file) if cut_file.is_file() else None
     draw_wake = FLAG.get("--wake", "1" if NAME == "nos6_held" else "0") == "1"
-    pressure_step = PASS / "postProcessing" / "surfacePressure" / step.name
     shape = np.concatenate(FACES, axis=0) if FACES is not None else centre
     wake_top = None
     if shape is not None:
@@ -478,20 +501,10 @@ def streamlines(centre):
         wake_top = hi[2] + 2 * width
     wake = []
     if draw_wake:
-        transfers, tol = fabric_transfers(pressure_step, tracks)
-        seeds = []
-        if field is not None and wake_top is not None and width > 0:
-            seeds, wake_top = recirculation_seeds(field[0], field[2]["U"].reshape(-1, 3), lo, hi, width)
-        traced = trace_saved_tracks(pressure_step, {
-            "continuation": (list(transfers.values()), "forward"),
-            "recirculation": (seeds, "bidirectional"),
-        })
-        wake = traced.get("recirculation", [])
-        if len(seeds):
-            print(f"след: {len(seeds)} начальных точек, {len(wake)} траекторий")
-        if transfers:
-            joined = join_transfers(tracks, transfers, traced.get("continuation", []), tol)
-            print(f"линии тока: продолжено через ткань {joined} из {len(transfers)}")
+        wake, traced_top = extend_streamlines(step, tracks, field, shape,
+                                             run_dir=RUN, pass_dir=PASS, case_name=NAME, case_journal=journal)
+        if traced_top is not None:
+            wake_top = traced_top
     fig, ax = plt.subplots(figsize=(7.5, 10.4), constrained_layout=True)
     vmax = 7 * V / 6
     if field is not None:
@@ -546,57 +559,6 @@ def shapes():
     ax.legend(frameon=False, fontsize=8)
     save(fig, "форма")
 
-def fabric_crossings(step, points, cells, level, coefficients):
-    """Связать стороны ткани там, где её парные грани пересекают сечение."""
-    fabric = paired_fabric(step)
-    if fabric is None:
-        return [], []
-    area, normal, drop, paired = fabric
-    d, cw = coefficients
-    un = 2.0 * drop / (d + np.sqrt(d * d + 4.0 * cw * np.abs(drop)))
-    width = np.ptp(points[:, 0])
-    tolerance = 1e-5 * max(np.ptp(points, axis=0).max(), 1.0)
-    locations, markers, seeds = [], [], []
-    for face in np.flatnonzero(paired & (np.abs(un) >= 0.05)):
-        segments = cut_segments([points[cells[face]]], level=level)
-        if not segments:
-            continue
-        x, z = np.mean(segments[0], axis=0)
-        middle = np.array([x, level, z])
-        if any(np.linalg.norm(middle - point) < 0.06 * width for point in locations):
-            continue
-        locations.append(middle)
-        direction = np.sign(un[face]) * normal[face]
-        velocity = np.tile(un[face] * normal[face], (2, 1))
-        half_length = 0.038 * width * direction
-        offset = max(4 * tolerance, 0.015 * np.sqrt(area[face])) * direction
-        markers.append((np.stack((middle - half_length, middle + half_length)), velocity))
-        seeds.append((middle - offset, middle + offset))
-    return markers, seeds
-
-
-def join_fabric_crossings(tracks, seeds, upstream, downstream, tolerance):
-    """Присоединить сохранённый переход к трассам с обеих сторон ткани."""
-    if not upstream or not downstream:
-        return 0
-    joined = 0
-    for index, (a, b) in enumerate(seeds):
-        ends = []
-        for target, candidates in ((a, upstream), (b, downstream)):
-            points, velocities = min(candidates, key=lambda track: min(
-                np.linalg.norm(track[0][0] - target), np.linalg.norm(track[0][-1] - target)))
-            if np.linalg.norm(points[0] - target) > np.linalg.norm(points[-1] - target):
-                points, velocities = points[::-1], velocities[::-1]
-            if np.linalg.norm(points[0] - target) > tolerance:
-                break
-            ends.append((points, velocities))
-        if len(ends) == 2:
-            (before, u_before), (after, u_after) = ends
-            tracks[index] = (np.vstack((before[::-1], after)), np.vstack((u_before[::-1], u_after)))
-            joined += 1
-    return joined
-
-
 def animation_data(run, name, pass_dir, case_journal):
     if pass_dir is None:
         raise ValueError(f"{name}: нет сохранённых проходов в {run}")
@@ -610,37 +572,21 @@ def animation_data(run, name, pass_dir, case_journal):
     if missing is not None:
         raise ValueError(f"Нет файла {missing}")
 
-    points, triangles, fields = section_field(cut_file)
-    cut_velocity = fields["U"].reshape(-1, 3)
+    field = section_field(cut_file)
+    points, triangles, fields = field
     surface_points, cells, _ = polys(surface)
     level = float(np.median(points[:, 1]))
     outline = cut_segments([surface_points[cell] for cell in cells], level=level)
     tracks = read_tracks(sorted(step.glob("*.vtp")))
     if not tracks:
         raise ValueError(f"В {step} нет пригодных траекторий с полем U")
-    fabric_line = re.search(r"(?:ВДУВОМ-ОТСОСОМ|Проницаемая ткань):[^\n]*?D\s*=\s*([\d.eE+\-]+)"
-                            r"[^\n]*?Cw\s*=\s*([\d.eE+\-]+)", case_journal)
-    crossings, seed_pairs = [], []
-    if fabric_line:
-        crossings, seed_pairs = fabric_crossings(pressure_step, surface_points, cells, level,
-                                                  tuple(map(float, fabric_line.groups())))
-        print(f"{name} {pass_dir.name}: локальных переходов через ткань {len(crossings)}")
     if FLAG.get("--wake", "1" if name == "nos6_held" else "0") == "1":
-        lo, hi = surface_points.min(axis=0), surface_points.max(axis=0)
-        seeds, _ = recirculation_seeds(points, cut_velocity, lo, hi, hi[0] - lo[0])
-        extra = trace_saved_tracks(pressure_step, {
-            "recirculation": (seeds, "bidirectional"),
-            "fabricUpstream": ([pair[0] for pair in seed_pairs], "backward"),
-            "fabricDownstream": ([pair[1] for pair in seed_pairs], "forward"),
-        }, run_dir=run, pass_dir=pass_dir, case_name=name)
-        if seed_pairs:
-            tol = 4e-5 * max(np.ptp(surface_points, axis=0).max(), 1.0)
-            joined = join_fabric_crossings(crossings, seed_pairs, extra.get("fabricUpstream", []),
-                                           extra.get("fabricDownstream", []), tol)
-            print(f"{name} {pass_dir.name}: продолжено через ткань {joined} из {len(seed_pairs)}")
-        tracks.extend(extra.get("recirculation", []))
+        wake, _ = extend_streamlines(step, tracks, field, surface_points,
+                                     run_dir=run, pass_dir=pass_dir, case_name=name, case_journal=case_journal)
+        tracks.extend(wake)
     label = f"{name} · проход {int(pass_dir.name[4:])}"
-    data = points, triangles.triangles, np.linalg.norm(cut_velocity, axis=1), surface_points, outline, tracks, crossings
+    speed = np.linalg.norm(fields["U"].reshape(-1, 3), axis=1)
+    data = points, triangles.triangles, speed, surface_points, outline, tracks
     return label, data
 
 
@@ -672,14 +618,20 @@ def animated_tracks(tracks, lo, hi):
     return curves
 
 
-def moving_dashes(curves, tick, trail=0.027):
+def moving_dashes(curves, tick):
     segments = []
     for elapsed, points, phases in curves:
         heads = (tick + phases) % elapsed[-1]
-        tails = np.maximum(heads - trail, 0.0)
+        tails = np.maximum(heads - 0.04, 0.0)
         samples = np.linspace(tails, heads, num=4, axis=1)
         projected = [np.interp(samples, elapsed, coordinate) for coordinate in points.T]
-        segments.extend(np.stack(projected, axis=-1))
+        shafts = np.stack(projected, axis=-1)
+        tip = shafts[:, -1]
+        tip_direction = tip - shafts[:, -2]
+        sideways = tip_direction[:, [1, 0]] * [-0.65, 0.65]
+        heads = np.stack((tip - tip_direction + sideways, tip, tip - tip_direction - sideways), axis=1)
+        segments.extend(shafts)
+        segments.extend(heads)
     return segments
 
 
@@ -733,19 +685,15 @@ def flow_gif(all_passes):
     for index, group in enumerate(panels):
         ax = fig.add_subplot(grid[index, 0])
         frames = []
-        for label, (points, triangles, speed, _, outline, tracks, crossings) in group:
+        for label, (points, triangles, speed, _, outline, tracks) in group:
             mesh = ax.tripcolor(points[:, 2], points[:, 0], triangles, speed, shading="gouraud",
                                 cmap="viridis", vmin=0, vmax=7 * V / 6, visible=False)
             contour = LineCollection(np.asarray(outline)[..., ::-1] if outline else [],
                                      colors=ink, linewidths=1.6, zorder=3, visible=False)
             dashes = LineCollection([], colors=ink, linewidths=0.9, alpha=0.80, zorder=2, visible=False)
-            cross_dashes = LineCollection([], colors="#ff77b6", linewidths=2.2, zorder=4, visible=False)
-            cross_dashes.set_path_effects([patheffects.withStroke(linewidth=3, foreground=background)])
             ax.add_collection(contour)
             ax.add_collection(dashes)
-            ax.add_collection(cross_dashes)
-            frames.append((label, (mesh, contour, dashes, cross_dashes),
-                           animated_tracks(tracks, lo, hi), animated_tracks(crossings, lo, hi)))
+            frames.append((label, (mesh, contour, dashes), animated_tracks(tracks, lo, hi)))
         ax.set(xlim=(lo[0], hi[0]), ylim=(lo[1], hi[1]), aspect="equal", facecolor=background,
                xticks=[], yticks=[])
         panel_label = ax.set_title("", loc="left", color=ink, fontsize=11, fontweight="bold")
@@ -764,7 +712,7 @@ def flow_gif(all_passes):
         nonlocal previous_index
         index = min(number // frames_per_pass, len(panels[0]) - 1)
         for panel_label, frames in layers:
-            label, artists, curves, crossings = frames[index]
+            label, artists, curves = frames[index]
             if index != previous_index:
                 if previous_index >= 0:
                     for artist in frames[previous_index][1]:
@@ -772,8 +720,7 @@ def flow_gif(all_passes):
                 for artist in artists:
                     artist.set_visible(True)
                 panel_label.set_text(label)
-            artists[-2].set_segments(moving_dashes(curves, number * 0.047))
-            artists[-1].set_segments(moving_dashes(crossings, number * 0.047, trail=0.20))
+            artists[-1].set_segments(moving_dashes(curves, number * 0.047))
         previous_index = index
 
     suffix = "flow_passes" if all_passes else "flow"
