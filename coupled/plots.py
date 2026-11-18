@@ -2,6 +2,7 @@
 
     python plots.py ИМЯ [--run=ПАПКА] [--pass=N] [--out=...] [--fields=...] [--V=...] [--wake=0|1]
     python plots.py ИМЯ --run=ПАПКА --gif=1 --pass=12 --compare-pass=1
+    python plots.py ИМЯ --run=ПАПКА --gif=all --wake=1
 
 ПАПКА -- где лежат out/ и fields/ (на кластере run/cc, run/s1, run/mks3 ...;
 по умолчанию текущая).  Проход -- последний сохранённый, если не задан.
@@ -537,16 +538,16 @@ def shapes():
 
 def animation_data(run, name, pass_dir, case_journal):
     if pass_dir is None:
-        raise SystemExit(f"{name}: нет сохранённых проходов в {run}")
+        raise ValueError(f"{name}: нет сохранённых проходов в {run}")
     step = last(pass_dir / "postProcessing" / "sets" / "streamlines")
     if step is None:
-        raise SystemExit(f"Нет сохранённых линий тока в {pass_dir}")
+        raise ValueError(f"Нет сохранённых линий тока в {pass_dir}")
     cut_file = pass_dir / "postProcessing" / "cut" / step.name / "plane.vtp"
     pressure_step = pass_dir / "postProcessing" / "surfacePressure" / step.name
     surface = pressure_step / "master.vtp"
     missing = next((path for path in (cut_file, surface) if not path.is_file()), None)
     if missing is not None:
-        raise SystemExit(f"Нет файла {missing}")
+        raise ValueError(f"Нет файла {missing}")
 
     points, triangles, fields = section_field(cut_file)
     cut_velocity = fields["U"].reshape(-1, 3)
@@ -555,11 +556,11 @@ def animation_data(run, name, pass_dir, case_journal):
     outline = cut_segments([surface_points[cell] for cell in cells], level=level)
     tracks = read_tracks(sorted(step.glob("*.vtp")))
     if not tracks:
-        raise SystemExit(f"В {step} нет пригодных траекторий с полем U")
+        raise ValueError(f"В {step} нет пригодных траекторий с полем U")
+    porous = "ВДУВОМ-ОТСОСОМ" in case_journal or "Проницаемая ткань:" in case_journal
     if FLAG.get("--wake", "1" if name == "nos6_held" else "0") == "1":
         lo, hi = surface_points.min(axis=0), surface_points.max(axis=0)
         seeds, _ = recirculation_seeds(points, cut_velocity, lo, hi, hi[0] - lo[0])
-        porous = "ВДУВОМ-ОТСОСОМ" in case_journal or "Проницаемая ткань:" in case_journal
         transfers, tol = fabric_transfers(pressure_step, tracks) if porous else ({}, 0.0)
         extra = trace_saved_tracks(pressure_step, {
             "recirculation": (seeds, "bidirectional"),
@@ -568,8 +569,14 @@ def animation_data(run, name, pass_dir, case_journal):
         if transfers:
             joined = join_transfers(tracks, transfers, extra.get("continuation", []), tol)
             print(f"{name} {pass_dir.name}: продолжено через ткань {joined} из {len(transfers)}")
+        elif porous:
+            print(f"{name} {pass_dir.name}: нет линий, подходящих для продолжения через ткань")
         tracks.extend(extra.get("recirculation", []))
-    return points, triangles.triangles, np.linalg.norm(cut_velocity, axis=1), surface_points, outline, tracks
+    elif porous:
+        print(f"{name} {pass_dir.name}: продолжение через ткань отключено (--wake=0)")
+    label = f"{name} · проход {int(pass_dir.name[4:])}"
+    data = points, triangles.triangles, np.linalg.norm(cut_velocity, axis=1), surface_points, outline, tracks
+    return label, data
 
 
 def animated_tracks(tracks, lo, hi):
@@ -611,8 +618,21 @@ def moving_dashes(curves, tick):
     return segments
 
 
-def flow_gif():
-    from matplotlib.animation import FuncAnimation, PillowWriter
+def animated_panels(all_passes):
+    if all_passes:
+        if any(key in FLAG for key in ("--pass", "--compare-pass", "--compare-run", "--compare-name")):
+            raise ValueError("--gif=all выбирает все проходы одного расчёта")
+        panels = []
+        folders = [path for path in passes if path.is_dir() and path.name[4:].isdigit()]
+        for pass_dir in sorted(folders, key=lambda path: int(path.name[4:])):
+            try:
+                panels.append(animation_data(RUN, NAME, pass_dir, journal))
+            except (OSError, ValueError) as error:
+                print(f"{pass_dir.name}: пропущен. {error}", file=sys.stderr)
+        if not panels:
+            raise ValueError(f"{NAME}: нет проходов с полями для анимации в {FIELDS}")
+        print("В GIF вошли проходы " + ", ".join(label.rsplit(" ", 1)[-1] for label, _ in panels))
+        return [panels]
 
     items = [(RUN, NAME, PASS, journal)]
     if "--compare-pass" in FLAG or "--compare-run" in FLAG:
@@ -625,8 +645,14 @@ def flow_gif():
         case_journal = other_log.read_text(encoding="utf-8") if other_log.is_file() else ""
         items.insert(0, (other, name, pass_dir, case_journal))
 
-    panels = [animation_data(*item) for item in items]
-    surface = np.concatenate([panel[3][:, [2, 0]] for panel in panels])
+    return [[animation_data(*item)] for item in items]
+
+
+def flow_gif(all_passes):
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    panels = animated_panels(all_passes)
+    surface = np.concatenate([panel[3][:, [2, 0]] for group in panels for _, panel in group])
     width = max(np.ptp(surface[:, 1]), np.ptp(surface[:, 0]))
     lo = surface.min(axis=0) - width * np.array([0.7, 0.48])
     hi = surface.max(axis=0) + width * np.array([2.0, 0.48])
@@ -636,44 +662,67 @@ def flow_gif():
                      facecolor=background, constrained_layout=True)
     grid = fig.add_gridspec(len(panels) + 1, 1, height_ratios=[0.055] + [1] * len(panels))
     cax = fig.add_subplot(grid[0, 0])
-    fig.suptitle("Обтекание купола", color=ink, fontsize=18, fontweight="bold")
+    title = "Обтекание купола по проходам" if all_passes else "Обтекание купола"
+    fig.suptitle(title, color=ink, fontsize=17, fontweight="bold")
     layers = []
-    for index, ((_, name, pass_dir, _), panel) in enumerate(zip(items, panels)):
-        points, triangles, speed, _, outline, tracks = panel
+    for index, group in enumerate(panels):
         ax = fig.add_subplot(grid[index + 1, 0])
-        mesh = ax.tripcolor(points[:, 2], points[:, 0], triangles, speed, shading="gouraud",
-                            cmap="viridis", vmin=0, vmax=7 * V / 6)
-        ax.add_collection(LineCollection(np.asarray(outline)[..., ::-1] if outline else [],
-                                         colors=ink, linewidths=1.6, zorder=3))
-        dashes = LineCollection([], colors=ink, linewidths=0.9, alpha=0.80, zorder=2)
-        ax.add_collection(dashes)
-        layers.append((dashes, animated_tracks(tracks, lo, hi)))
-        label = f"{name} · проход {int(pass_dir.name[4:])}"
+        frames = []
+        for label, (points, triangles, speed, _, outline, tracks) in group:
+            mesh = ax.tripcolor(points[:, 2], points[:, 0], triangles, speed, shading="gouraud",
+                                cmap="viridis", vmin=0, vmax=7 * V / 6, visible=False)
+            contour = LineCollection(np.asarray(outline)[..., ::-1] if outline else [],
+                                     colors=ink, linewidths=1.6, zorder=3, visible=False)
+            dashes = LineCollection([], colors=ink, linewidths=0.9, alpha=0.80, zorder=2, visible=False)
+            ax.add_collection(contour)
+            ax.add_collection(dashes)
+            frames.append((label, (mesh, contour, dashes), animated_tracks(tracks, lo, hi)))
         ax.set(xlim=(lo[0], hi[0]), ylim=(lo[1], hi[1]), aspect="equal", facecolor=background,
                xticks=[], yticks=[])
-        ax.set_title(label, loc="left", color=ink, fontsize=11, fontweight="bold")
+        panel_label = ax.set_title("", loc="left", color=ink, fontsize=11, fontweight="bold")
+        layers.append((panel_label, frames))
         if index == len(panels) - 1:
-            ax.set_xlabel("Поток →  (+z)   ·   Установившееся поле скорости", color=ink, fontsize=9)
+            caption = "Номер прохода  ·  Поток → (+z)" if all_passes else "Поток →  (+z)   ·   Установившееся поле скорости"
+            ax.set_xlabel(caption, color=ink, fontsize=9)
         for spine in ax.spines.values():
             spine.set_color("#485467")
     bar = fig.colorbar(mesh, cax=cax, orientation="horizontal", extend="max")
     bar.set_label("Модуль скорости, м/с", color=ink, fontsize=9)
     bar.ax.tick_params(colors=ink, labelsize=8)
 
-    def draw(number):
-        for dashes, curves in layers:
-            dashes.set_segments(moving_dashes(curves, number * 0.047))
-
     fps = 12
-    path = PICS / f"{NAME}_flow.gif"
-    movie = FuncAnimation(fig, draw, frames=72, cache_frame_data=False)
+    frames_per_pass = 10
+    previous_index = -1
+
+    def draw(number):
+        nonlocal previous_index
+        index = min(number // frames_per_pass, len(panels[0]) - 1)
+        for panel_label, frames in layers:
+            label, artists, curves = frames[index]
+            if index != previous_index:
+                if previous_index >= 0:
+                    for artist in frames[previous_index][1]:
+                        artist.set_visible(False)
+                for artist in artists:
+                    artist.set_visible(True)
+                panel_label.set_text(label)
+            artists[-1].set_segments(moving_dashes(curves, number * 0.047))
+        previous_index = index
+
+    suffix = "flow_passes" if all_passes else "flow"
+    path = PICS / f"{NAME}_{suffix}.gif"
+    frame_count = frames_per_pass * len(panels[0]) + fps if all_passes else 72
+    movie = FuncAnimation(fig, draw, frames=frame_count, cache_frame_data=False)
     movie.save(path, writer=PillowWriter(fps=fps), dpi=100)
     plt.close(fig)
     print(path)
 
 
-if FLAG.get("--gif") == "1":
-    flow_gif()
+if FLAG.get("--gif") in {"1", "all"}:
+    try:
+        flow_gif(FLAG["--gif"] == "all")
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
 else:
     history()
     if PASS is None:
