@@ -1,6 +1,7 @@
 """Картинки по посчитанному случаю связки -- без ParaView, только matplotlib.
 
     python plots.py ИМЯ [--run=ПАПКА] [--pass=N] [--out=...] [--fields=...] [--V=...] [--wake=0|1]
+    python plots.py ИМЯ --run=ПАПКА --gif=1 --pass=12 --compare-pass=1
 
 ПАПКА -- где лежат out/ и fields/ (на кластере run/cc, run/s1, run/mks3 ...;
 по умолчанию текущая).  Проход -- последний сохранённый, если не задан.
@@ -343,14 +344,14 @@ def recirculation_seeds(points, velocity, lo, hi, width):
     return np.c_[chosen_x, np.zeros(len(chosen)), chosen_z], high[1]
 
 
-def trace_saved_tracks(step, requests):
+def trace_saved_tracks(step, requests, *, run_dir=RUN, pass_dir=PASS, case_name=NAME):
     """Трассировка по сохранённому полю U во временном кейсе."""
     requests = {name: (points, direction) for name, (points, direction) in requests.items() if len(points)}
     if not requests:
         return {}
     tool = shutil.which("simpleFoam")
-    case = RUN / "case"
-    if tool is None or not (PASS / "polyMesh").is_dir() or not (PASS / step.name / "U").is_file():
+    case = run_dir / "case"
+    if tool is None or not (pass_dir / "polyMesh").is_dir() or not (pass_dir / step.name / "U").is_file():
         print("след: нужны simpleFoam, polyMesh и U того же прохода, что и surfacePressure")
         return {}
     functions = []
@@ -365,16 +366,16 @@ def trace_saved_tracks(step, requests):
         seedSampleSet {{ type cloud; axis xyz; points ({points}); }}
     }}""")
     streamlines_dict = "\n".join(functions)
-    log = PICS / f"{NAME}_{PASS.name}_след.log"
+    log = PICS / f"{case_name}_{pass_dir.name}_след.log"
     try:
         with tempfile.TemporaryDirectory(prefix="nos6_wake_") as tmp:
             work = Path(tmp)
             (work / "system").mkdir()
             (work / "constant").mkdir()
             (work / step.name).mkdir()
-            shutil.copytree(PASS / "polyMesh", work / "constant" / "polyMesh")
+            shutil.copytree(pass_dir / "polyMesh", work / "constant" / "polyMesh")
             for name in ("U", "p", "phi", "k", "omega", "nut"):
-                value = PASS / step.name / name
+                value = pass_dir / step.name / name
                 if value.is_file():
                     shutil.copy2(value, work / step.name / name)
             for name in ("system/fvSchemes", "system/fvSolution", "constant/transportProperties",
@@ -399,7 +400,7 @@ functions
                 paths = sorted((sets / name).rglob("*.vtp"))
                 for path in paths:
                     label = "продолжение" if name == "continuation" else "рециркуляция"
-                    shutil.copy2(path, PICS / f"{NAME}_{PASS.name}_{label}_{path.name}")
+                    shutil.copy2(path, PICS / f"{case_name}_{pass_dir.name}_{label}_{path.name}")
                 result[name] = read_tracks(paths)
             if not any(result.values()):
                 print(f"след: OpenFOAM не записал траектории, см. {log}")
@@ -534,11 +535,151 @@ def shapes():
     ax.legend(frameon=False, fontsize=8)
     save(fig, "форма")
 
-history()
-if PASS is None:
-    print(f"нет сохранённых полей в {FIELDS}")
+def animation_data(run, name, pass_dir, case_journal):
+    if pass_dir is None:
+        raise SystemExit(f"{name}: нет сохранённых проходов в {run}")
+    step = last(pass_dir / "postProcessing" / "sets" / "streamlines")
+    if step is None:
+        raise SystemExit(f"Нет сохранённых линий тока в {pass_dir}")
+    cut_file = pass_dir / "postProcessing" / "cut" / step.name / "plane.vtp"
+    pressure_step = pass_dir / "postProcessing" / "surfacePressure" / step.name
+    surface = pressure_step / "master.vtp"
+    missing = next((path for path in (cut_file, surface) if not path.is_file()), None)
+    if missing is not None:
+        raise SystemExit(f"Нет файла {missing}")
+
+    points, triangles, fields = section_field(cut_file)
+    cut_velocity = fields["U"].reshape(-1, 3)
+    surface_points, cells, _ = polys(surface)
+    level = float(np.median(points[:, 1]))
+    outline = cut_segments([surface_points[cell] for cell in cells], level=level)
+    tracks = read_tracks(sorted(step.glob("*.vtp")))
+    if not tracks:
+        raise SystemExit(f"В {step} нет пригодных траекторий с полем U")
+    if FLAG.get("--wake", "1" if name == "nos6_held" else "0") == "1":
+        lo, hi = surface_points.min(axis=0), surface_points.max(axis=0)
+        seeds, _ = recirculation_seeds(points, cut_velocity, lo, hi, hi[0] - lo[0])
+        porous = "ВДУВОМ-ОТСОСОМ" in case_journal or "Проницаемая ткань:" in case_journal
+        transfers, tol = fabric_transfers(pressure_step, tracks) if porous else ({}, 0.0)
+        extra = trace_saved_tracks(pressure_step, {
+            "recirculation": (seeds, "bidirectional"),
+            "continuation": (list(transfers.values()), "forward"),
+        }, run_dir=run, pass_dir=pass_dir, case_name=name)
+        if transfers:
+            joined = join_transfers(tracks, transfers, extra.get("continuation", []), tol)
+            print(f"{name} {pass_dir.name}: продолжено через ткань {joined} из {len(transfers)}")
+        tracks.extend(extra.get("recirculation", []))
+    return points, triangles.triangles, np.linalg.norm(cut_velocity, axis=1), surface_points, outline, tracks
+
+
+def animated_tracks(tracks, lo, hi):
+    """Prepare advection along each saved 3D polyline before projecting to xz."""
+    rng = np.random.default_rng(42)
+    curves = []
+    for points, velocity in tracks:
+        in_view = np.all((lo <= points[:, [2, 0]]) & (points[:, [2, 0]] <= hi), axis=1)
+        hits = np.flatnonzero(in_view)
+        if len(hits) < 2:
+            continue
+        start, stop = max(0, hits[0] - 1), hits[-1] + 2
+        points, velocity = points[start:stop], velocity[start:stop]
+        tangent = np.diff(points, axis=0)
+        mean_u = 0.5 * (velocity[1:] + velocity[:-1])
+        distance = np.linalg.norm(tangent, axis=1)
+        speed = np.linalg.norm(mean_u, axis=1)
+        if np.sum(tangent * mean_u) < 0.0:
+            points, distance, speed = points[::-1], distance[::-1], speed[::-1]
+        keep = distance > 1e-8
+        if not keep.any():
+            continue
+        elapsed = np.r_[0.0, np.cumsum(distance[keep] / np.maximum(speed[keep], 1e-3))]
+        period = elapsed[-1]
+        count = min(16, max(1, int(period / 0.12)))
+        phases = (np.arange(count) + rng.random()) * period / count
+        curves.append((elapsed, points[np.r_[True, keep]][:, [2, 0]], phases))
+    return curves
+
+
+def moving_dashes(curves, tick):
+    segments = []
+    for elapsed, points, phases in curves:
+        heads = (tick + phases) % elapsed[-1]
+        tails = np.maximum(heads - 0.027, 0.0)
+        samples = np.linspace(tails, heads, num=4, axis=1)
+        projected = [np.interp(samples, elapsed, coordinate) for coordinate in points.T]
+        segments.extend(np.stack(projected, axis=-1))
+    return segments
+
+
+def flow_gif():
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    items = [(RUN, NAME, PASS, journal)]
+    if "--compare-pass" in FLAG or "--compare-run" in FLAG:
+        other = Path(FLAG.get("--compare-run", RUN)).resolve()
+        name = FLAG.get("--compare-name", NAME)
+        folder = other / "fields" / name
+        step = FLAG.get("--compare-pass")
+        pass_dir = folder / f"pass{int(step):02d}" if step else max(folder.glob("pass*"), default=None)
+        other_log = other / "out" / f"{name}.txt"
+        case_journal = other_log.read_text(encoding="utf-8") if other_log.is_file() else ""
+        items.insert(0, (other, name, pass_dir, case_journal))
+
+    panels = [animation_data(*item) for item in items]
+    surface = np.concatenate([panel[3][:, [2, 0]] for panel in panels])
+    width = max(np.ptp(surface[:, 1]), np.ptp(surface[:, 0]))
+    lo = surface.min(axis=0) - width * np.array([0.7, 0.48])
+    hi = surface.max(axis=0) + width * np.array([2.0, 0.48])
+
+    background, ink = "#10151d", "#f3f7fb"
+    fig = plt.figure(figsize=(5.4, 9.6) if len(panels) == 2 else (7.2, 4.8),
+                     facecolor=background, constrained_layout=True)
+    grid = fig.add_gridspec(len(panels) + 1, 1, height_ratios=[0.055] + [1] * len(panels))
+    cax = fig.add_subplot(grid[0, 0])
+    fig.suptitle("Обтекание купола", color=ink, fontsize=18, fontweight="bold")
+    layers = []
+    for index, ((_, name, pass_dir, _), panel) in enumerate(zip(items, panels)):
+        points, triangles, speed, _, outline, tracks = panel
+        ax = fig.add_subplot(grid[index + 1, 0])
+        mesh = ax.tripcolor(points[:, 2], points[:, 0], triangles, speed, shading="gouraud",
+                            cmap="viridis", vmin=0, vmax=7 * V / 6)
+        ax.add_collection(LineCollection(np.asarray(outline)[..., ::-1] if outline else [],
+                                         colors=ink, linewidths=1.6, zorder=3))
+        dashes = LineCollection([], colors=ink, linewidths=0.9, alpha=0.80, zorder=2)
+        ax.add_collection(dashes)
+        layers.append((dashes, animated_tracks(tracks, lo, hi)))
+        label = f"{name} · проход {int(pass_dir.name[4:])}"
+        ax.set(xlim=(lo[0], hi[0]), ylim=(lo[1], hi[1]), aspect="equal", facecolor=background,
+               xticks=[], yticks=[])
+        ax.set_title(label, loc="left", color=ink, fontsize=11, fontweight="bold")
+        if index == len(panels) - 1:
+            ax.set_xlabel("Поток →  (+z)   ·   Установившееся поле скорости", color=ink, fontsize=9)
+        for spine in ax.spines.values():
+            spine.set_color("#485467")
+    bar = fig.colorbar(mesh, cax=cax, orientation="horizontal", extend="max")
+    bar.set_label("Модуль скорости, м/с", color=ink, fontsize=9)
+    bar.ax.tick_params(colors=ink, labelsize=8)
+
+    def draw(number):
+        for dashes, curves in layers:
+            dashes.set_segments(moving_dashes(curves, number * 0.047))
+
+    fps = 12
+    path = PICS / f"{NAME}_flow.gif"
+    movie = FuncAnimation(fig, draw, frames=72, cache_frame_data=False)
+    movie.save(path, writer=PillowWriter(fps=fps), dpi=100)
+    plt.close(fig)
+    print(path)
+
+
+if FLAG.get("--gif") == "1":
+    flow_gif()
 else:
-    c = canopy_pressure()
-    section(c)
-    streamlines(c)
-shapes()
+    history()
+    if PASS is None:
+        print(f"нет сохранённых полей в {FIELDS}")
+    else:
+        c = canopy_pressure()
+        section(c)
+        streamlines(c)
+    shapes()
