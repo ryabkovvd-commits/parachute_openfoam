@@ -2,7 +2,7 @@
 
     python plots.py ИМЯ [--run=ПАПКА] [--pass=N] [--out=...] [--fields=...] [--V=...] [--wake=0|1]
     python plots.py ИМЯ --run=ПАПКА --gif=1 --pass=12 --compare-pass=1
-    python plots.py ИМЯ --run=ПАПКА --gif=all --wake=1
+    python plots.py ИМЯ --run=ПАПКА --gif=all --wake=1 [--jobs=N]
 
 ПАПКА -- где лежат out/ и fields/ (на кластере run/cc, run/s1, run/mks3 ...;
 по умолчанию текущая).  Проход -- последний сохранённый, если не задан.
@@ -24,6 +24,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib
 matplotlib.use("Agg")
@@ -717,13 +718,23 @@ def animated_panels(all_passes):
     if all_passes:
         if any(key in FLAG for key in ("--pass", "--compare-pass", "--compare-run", "--compare-name")):
             raise ValueError("--gif=all выбирает все проходы одного расчёта")
-        panels = []
-        folders = [path for path in passes if path.is_dir() and path.name[4:].isdigit()]
-        for pass_dir in sorted(folders, key=lambda path: int(path.name[4:])):
+        folders = sorted((path for path in passes if path.is_dir() and path.name[4:].isdigit()),
+                         key=lambda path: int(path.name[4:]))
+        jobs = int(FLAG.get("--jobs", "1"))
+        if jobs < 1:
+            raise ValueError("--jobs должен быть целым положительным числом")
+
+        def load_panel(pass_dir):
             try:
-                panels.append(animation_data(RUN, NAME, pass_dir, journal))
+                return animation_data(RUN, NAME, pass_dir, journal)
             except (OSError, ValueError) as error:
                 print(f"{pass_dir.name}: пропущен. {error}", file=sys.stderr)
+
+        workers = min(jobs, len(folders)) or 1
+        if workers > 1:
+            print(f"Подготовка полей и линий тока: до {workers} проходов одновременно", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            panels = [panel for panel in executor.map(load_panel, folders) if panel is not None]
         if not panels:
             raise ValueError(f"{NAME}: нет проходов с полями для анимации в {FIELDS}")
         print("В GIF вошли проходы " + ", ".join(label.rsplit(" ", 1)[-1] for label, _ in panels))
