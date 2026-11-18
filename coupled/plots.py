@@ -684,19 +684,23 @@ def animated_tracks(tracks, lo, hi):
         keep = distance > 1e-8
         if not keep.any():
             continue
-        elapsed = np.r_[0.0, np.cumsum(distance[keep] / np.maximum(speed[keep], 1e-3))]
+        length = distance[keep]
+        elapsed = np.r_[0.0, np.cumsum(length / np.maximum(speed[keep], 1e-3))]
+        arc = np.r_[0.0, np.cumsum(length)]
         period = elapsed[-1]
         count = min(16, max(1, int(period / 0.12)))
         phases = (np.arange(count) + rng.random()) * period / count
-        curves.append((elapsed, points[np.r_[True, keep]][:, [2, 0]], phases))
+        curves.append((elapsed, arc, points[np.r_[True, keep]][:, [2, 0]], phases))
     return curves
 
 
-def moving_dashes(curves, tick):
+def moving_dashes(curves, tick, max_length):
     segments = []
-    for elapsed, points, phases in curves:
+    for elapsed, arc, points, phases in curves:
         heads = (tick + phases) % elapsed[-1]
         tails = np.maximum(heads - 0.04, 0.0)
+        tail_distance = np.interp(heads, elapsed, arc) - max_length
+        tails = np.maximum(tails, np.interp(tail_distance, arc, elapsed))
         samples = np.linspace(tails, heads, num=4, axis=1)
         projected = [np.interp(samples, elapsed, coordinate) for coordinate in points.T]
         shafts = np.stack(projected, axis=-1)
@@ -749,7 +753,8 @@ def flow_gif(all_passes):
     hi = surface.max(axis=0) + width * np.array([2.0, 0.48])
 
     background, ink = "#10151d", "#f3f7fb"
-    fig = plt.figure(figsize=(5.4, 9.6) if len(panels) == 2 else (7.2, 4.8), facecolor=background)
+    fig = plt.figure(figsize=(5.4, 9.6) if len(panels) == 2 else (7.2, 4.8),
+                     facecolor=background, dpi=100)
     grid = fig.add_gridspec(len(panels), 1, left=0.035, right=0.965,
                            bottom=0.055, top=0.74, hspace=0.23)
     cax = fig.add_axes([0.055, 0.85, 0.89, 0.031])
@@ -777,7 +782,10 @@ def flow_gif(all_passes):
         ax.set(xlim=(lo[0], hi[0]), ylim=(lo[1], hi[1]), aspect="equal", facecolor=background,
                xticks=[], yticks=[])
         panel_label = ax.set_title("", loc="left", color=ink, fontsize=11, fontweight="bold")
-        layers.append((panel_label, frames))
+        # Limit the arrow length on the rendered frame while keeping the same advection time.
+        ax.apply_aspect()
+        max_length = 12 * (hi[0] - lo[0]) / ax.bbox.width
+        layers.append((panel_label, frames, max_length))
         for spine in ax.spines.values():
             spine.set_color("#485467")
     bar = fig.colorbar(mesh, cax=cax, orientation="horizontal", extend="max")
@@ -791,7 +799,7 @@ def flow_gif(all_passes):
     def draw(number):
         nonlocal previous_index
         index = min(number // frames_per_pass, len(panels[0]) - 1)
-        for panel_label, frames in layers:
+        for panel_label, frames, max_length in layers:
             label, artists, curves, fabric_curves = frames[index]
             if index != previous_index:
                 if previous_index >= 0:
@@ -800,15 +808,15 @@ def flow_gif(all_passes):
                 for artist in artists:
                     artist.set_visible(True)
                 panel_label.set_text(label)
-            artists[-2].set_segments(moving_dashes(curves, number * 0.047))
-            artists[-1].set_segments(moving_dashes(fabric_curves, number * 0.047))
+            artists[-2].set_segments(moving_dashes(curves, number * 0.047, max_length))
+            artists[-1].set_segments(moving_dashes(fabric_curves, number * 0.047, max_length))
         previous_index = index
 
     suffix = "flow_passes" if all_passes else "flow"
     path = PICS / f"{NAME}_{suffix}.gif"
     frame_count = frames_per_pass * len(panels[0]) + fps if all_passes else 72
     movie = FuncAnimation(fig, draw, frames=frame_count, cache_frame_data=False)
-    movie.save(path, writer=PillowWriter(fps=fps), dpi=100)
+    movie.save(path, writer=PillowWriter(fps=fps), dpi=fig.dpi)
     plt.close(fig)
     print(path)
 
