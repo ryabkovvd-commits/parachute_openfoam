@@ -850,6 +850,12 @@ for step in range(len(history) + 1, PASSES + 1):
         say(f"  {step:>2}  {why_failed(code)}")
         break
 
+    # Preserve the exact structural input of this completed CFD pass. The
+    # relaxed frame written below belongs to the NEXT pass instead.
+    input_archive = FIELDS / NAME / f"pass{step:02d}"
+    input_archive.mkdir(parents=True, exist_ok=True)
+    np.save(input_archive / "input_shape.npy", mesh_shape)
+
     load, total, dcp = nodal_load(mesh, folder)
     # Невязка НАГРУЗКИ между проходами, а не только формы: момент сходится
     # позже силы и формы (на 250-й итерации бывает обратного знака), а
@@ -920,6 +926,9 @@ for step in range(len(history) + 1, PASSES + 1):
         "drag": float(total @ ONSET), "side": float(total @ SIDE),
         "moment": float(torque @ PIVOT), "minutes": (time.time() - started) / 60,
         "gores": GORES, "lines": LINES, "hold": HOLD,
+        "D0": D0, "S0": S0, "V": V, "rho": RHO, "nu": NU,
+        "canopy_model": ("fabric" if "--fabric" in FLAGS else
+                         "sink" if "--sink" in FLAGS else "wall"),
         "stride": STRIDE, "rings": RINGS, "ropes": GORES // STRIDE,
         "shear": SHEAR,
     }

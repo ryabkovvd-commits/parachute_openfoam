@@ -36,23 +36,8 @@ if [ ! -s out/nos6_held.json ]; then
     echo "No completed CFD passes in $W. See the job output and case/log.*" >&2
     exit 1
 fi
-N=$(PYTHONPATH="$B/coupled" "$P" - <<'PY'
-import json
-import numpy as np
-from nos6_geometry import closed_circular, export_closed_surface
-
-with open('out/nos6_held.json', encoding='utf-8') as f:
-    r = json.load(f)[-1]
-d = r['lines']
-m = closed_circular(d, d, gores=r['gores'], rings=r['rings'],
-                    line_stride=r['stride'], shear_ratio=r['shear'])
-m.position = np.load('out/nos6_held_shape.npy', allow_pickle=False)
-stl = export_closed_surface(m, 'pics/parachute.stl', subdivide=4)
-if 'cord_width_m' in r:
-    from cords import append_cords_stl
-    append_cords_stl(m, r['cord_width_m'], stl)
-print(r['pass'])
-PY
-)
-"$P" "$B/coupled/plots.py" nos6_held --pass="$N" --V=30
-exit "$ret"
+post_opts=(--speed=30 --wake="${NOS6_WAKE:-1}" --gif="${NOS6_GIF:-off}" --jobs="${SLURM_CPUS_PER_TASK:-1}")
+post_ret=0
+"$P" "$B/coupled/nos6_results.py" case "$W" "${post_opts[@]}" || post_ret=$?
+if (( ret != 0 )); then exit "$ret"; fi
+exit "$post_ret"

@@ -24,17 +24,20 @@ def arrays(path):
     """Все DataArray файла: имя -> массив."""
     text = Path(path).read_text(errors="replace")
     out = {}
+    header_bytes = 4 if re.search(r'''header_type=["']UInt32["']''', text) else 8
     for m in re.finditer(r"<DataArray([^>]*)>(.*?)</DataArray>", text, re.S):
         attrs, body = m.group(1), m.group(2)
-        name = re.search(r"Name='([^']*)'", attrs)
-        kind = re.search(r"type='([^']*)'", attrs)
+        name = re.search(r'''Name=["']([^"']*)["']''', attrs)
+        kind = re.search(r'''type=["']([^"']*)["']''', attrs)
         if not name or not kind or kind.group(1) not in KINDS:
             continue
-        blob = base64.b64decode("".join(body.split()))
-        # Первые восемь байт -- длина блока, её пропускаем.
-        data = np.frombuffer(blob[8:], dtype=KINDS[kind.group(1)])
-        comps = re.search(r"NumberOfComponents='(\d+)'", attrs)
-        if comps:
+        if re.search(r'''format=["']ascii["']''', attrs):
+            data = np.fromstring(body, sep=" ", dtype=KINDS[kind.group(1)])
+        else:
+            blob = base64.b64decode("".join(body.split()))
+            data = np.frombuffer(blob[header_bytes:], dtype=KINDS[kind.group(1)])
+        comps = re.search(r'''NumberOfComponents=["'](\d+)["']''', attrs)
+        if comps and int(comps.group(1)) > 1:
             data = data.reshape(-1, int(comps.group(1)))
         out.setdefault(name.group(1), data)
     return out
