@@ -23,7 +23,7 @@ S=$(( (96 + C - 1) / C ))
 if (( S < 2 )); then S=2; fi
 G=$(( C * S ))
 A=$((5 * SLURM_ARRAY_TASK_ID))
-W=$B/run/nos6wall/$SLURM_ARRAY_JOB_ID/$(printf 'a%02d' "$A")
+W=$B/run/nos6wall/${NOS6_SERIES_ID:-$SLURM_ARRAY_JOB_ID}/$(printf 'a%02d' "$A")
 mkdir -p "$W/pics"
 cd "$W"
 opts=(--patch=nos6)
