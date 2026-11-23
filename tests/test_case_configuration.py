@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 class ConfigurationTests(unittest.TestCase):
-    def generated(self,fabric):
+    def generated(self,fabric,extra=(),passes=12,seed=None):
         base = Path(__file__).resolve().parents[1]/'coupled'
         captured = {}
         class StopBeforeExecution(Exception):
@@ -18,9 +18,9 @@ class ConfigurationTests(unittest.TestCase):
                 raise StopBeforeExecution()
             return trace
         old_argv,old_path,old_trace = sys.argv[:],sys.path[:],sys.gettrace()
-        sys.argv = [str(base/'cs.py'),'nos6_held','0','0','2000','12','--patch=nos6,cords',
+        sys.argv = [str(base/'cs.py'),'nos6_held','0','0','2000',str(passes)]+([str(seed)] if seed else [])+['--patch=nos6,cords',
                     '--cord-mm=3.2','--угол=30','--полотнищ=96','--шаг=4','--сдвиг=0.02',
-                    '--V=30','--nu=1.46e-5']+(['--fabric=33.2,28.6'] if fabric else [])
+                    '--V=30','--nu=1.46e-5']+(['--fabric=33.2,28.6'] if fabric else [])+list(extra)
         sys.settrace(trace)
         try:
             runpy.run_path(str(base/'cs.py'),run_name='__main__')
@@ -31,7 +31,8 @@ class ConfigurationTests(unittest.TestCase):
             sys.argv,sys.path = old_argv,old_path
         source = captured['source']
         compile(source,'generated-cluster-case','exec')
-        for text in ['input_shape.npy','if steady >= 2 and step >= 6:',
+        minimum=1 if '--fixed-shape' in extra else 6
+        for text in ['input_shape.npy',f'if steady >= 2 and step >= {minimum}:',
                      'SHIFT_TOL, LOAD_TOL = 0.03, None','cord_load = read_cord_load',
                      '"canopy_model"','"D0": D0']:
             self.assertIn(text,source)

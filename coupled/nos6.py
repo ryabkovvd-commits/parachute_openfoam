@@ -24,7 +24,7 @@ sub("mesh = flat_circular(D0, LINES,", "mesh = closed_circular(D0, LINES,")
 sub("export_surface(mesh,", "export_closed_surface(mesh,", count=2)
 
 if sys.argv[1] == "nos6_held":
-    min_passes = 6
+    min_passes = 1 if '--fixed-shape' in sys.argv else 6
     # The series criteria take precedence over the cord patch's defaults.
     header_start = src.index("# ---- случай ")
     header_end = src.index("mesh = closed_circular(", header_start)
@@ -51,6 +51,7 @@ for _m in MODE:
               .replace("Cord drag: b=", "Сопротивление строп: d = ")
               .replace(" mm, Cd=", " мм, Cd = "))
 ''' + (
+        'say("Фиксированная форма: один CFD-проход без структурной релаксации")\n' if '--fixed-shape' in sys.argv else
         'say(f"Выполняем все {PASSES} проходов")\n' if "--all-passes" in sys.argv else
         f'say(f"Проходы {min_passes}–{{PASSES}} | два прохода подряд: '
         'невязка формы < {SHIFT_TOL:.0e} от D0'

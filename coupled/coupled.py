@@ -79,6 +79,9 @@ PULLED = int(WORDS[2])
 ITERS = int(WORDS[3]) if len(WORDS) > 3 else 2000
 PASSES = int(WORDS[4]) if len(WORDS) > 4 else 4
 SEED = Path(WORDS[5]) if len(WORDS) > 5 else None
+FIXED_SHAPE = "--fixed-shape" in FLAGS
+if FIXED_SHAPE and (PASSES!=1 or SEED is None or not SEED.is_file() or PULLED):
+    raise ValueError('--fixed-shape requires one CFD pass, an existing input shape and no line pulling')
 
 #: Продувка под заданным углом атаки: --угол=35.  Привес держим, форму нет.
 #:
@@ -769,7 +772,7 @@ else:
 if PULLED:
     mesh.rest_length[mesh.line_rods[:PULLED]] += STROKE
 
-if HOLD is not None:
+if HOLD is not None and not FIXED_SHAPE:
     mesh.position = set_attitude(mesh.position, HOLD, mesh.confluence[0])
 
 say(f"старт: наклон {tilt_of(mesh.position):.2f}°, "
@@ -877,9 +880,9 @@ for step in range(len(history) + 1, PASSES + 1):
     #: сложенного.
     ratio_seen = float(mesh.projected_diameter() / D0)
 
-    relaxed = False
+    relaxed = FIXED_SHAPE
     applied = attitude_reaction(mesh, load) if HOLD is not None and HOLDER else load
-    for _ in range(CHUNKS):
+    for _ in range(0 if FIXED_SHAPE else CHUNKS):
         result = inflate(mesh, node_force=applied, damping=0.98, tolerance=2e-3,
                          drift_tolerance=1e-8, max_steps=CHUNK)
         if result.converged:
@@ -898,12 +901,12 @@ for step in range(len(history) + 1, PASSES + 1):
     settled = mesh.position.copy()
     # Привес снимаем ДО невязки, иначе Эйткен подбирал бы множитель по
     # смеси поворота и деформации, а поворот мы всё равно уберём.
-    if HOLD is not None:
+    if HOLD is not None and not FIXED_SHAPE:
         settled = set_attitude(settled, HOLD, mesh.confluence[0])
     residual = settled - previous
-    omega = aitken_factor(residual, last_residual, omega)
+    omega = 0.0 if FIXED_SHAPE else aitken_factor(residual, last_residual, omega)
     mesh.position = previous + omega * residual
-    if HOLD is not None:
+    if HOLD is not None and not FIXED_SHAPE:
         # Смесь двух форм с одинаковым привесом сама привес почти держит,
         # но линейная смесь поворотов точной не бывает -- поправляем.
         mesh.position = set_attitude(mesh.position, HOLD, mesh.confluence[0])
@@ -927,6 +930,8 @@ for step in range(len(history) + 1, PASSES + 1):
         "moment": float(torque @ PIVOT), "minutes": (time.time() - started) / 60,
         "gores": GORES, "lines": LINES, "hold": HOLD,
         "D0": D0, "S0": S0, "V": V, "rho": RHO, "nu": NU,
+        "fixed_shape": FIXED_SHAPE, "fabric_coefficients": FLAGS.get('--fabric'),
+        "mesh_source": FLAGS.get('--mesh-from'),
         "canopy_model": ("fabric" if "--fabric" in FLAGS else
                          "sink" if "--sink" in FLAGS else "wall"),
         "stride": STRIDE, "rings": RINGS, "ropes": GORES // STRIDE,
@@ -1007,7 +1012,11 @@ if history:
     say(f"  проходов {len(history)}, "
         f"всего {sum(r['minutes'] for r in history) / 60:.1f} ч")
     last["settled"] = settled
-    if settled:
+    if FIXED_SHAPE:
+        last['settled'] = None
+        (OUT / f"{NAME}.fixed").write_text(json.dumps(last,ensure_ascii=False,indent=1),encoding='utf-8')
+        say('  Фиксированная форма: один CFD-проход завершён; сходимость CFD проверяется отдельно')
+    elif settled:
         DONE.write_text(json.dumps(last, ensure_ascii=False, indent=1),
                         encoding="utf-8")
     else:

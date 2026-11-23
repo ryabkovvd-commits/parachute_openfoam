@@ -362,6 +362,8 @@ def case(work,args):
 
     def cord_loads():
         from cord_study import confluence_loads
+        if row.get('fixed_shape'):
+            raise FileNotFoundError('Fixed-shape probe: inherited structural tensions are not a response to the new flow')
         if args.pole!='closed' or not np.isclose(diameter,np.sqrt(24/np.pi)):
             raise FileNotFoundError('Confluence helper requires the closed 6 m2 model')
         confluence_loads(work,args.name,records,work/'out')

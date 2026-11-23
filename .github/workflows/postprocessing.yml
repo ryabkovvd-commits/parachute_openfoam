@@ -18,4 +18,4 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python -m compileall -q coupled
       - run: python -m unittest discover -s tests -v
-      - run: bash -n cluster/nos6_held.slurm && bash -n cluster/nos6_wall.slurm && bash -n cluster/postprocess.slurm
+      - run: bash -n cluster/nos6_held.slurm && bash -n cluster/nos6_wall.slurm && bash -n cluster/postprocess.slurm && bash -n cluster/permeability_models.slurm

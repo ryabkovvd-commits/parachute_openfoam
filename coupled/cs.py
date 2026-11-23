@@ -77,6 +77,24 @@ line("CORES = 4", 'CORES = int(os.environ.get("SLURM_NTASKS", 4))')
 line("WHERE = ", "WHERE = quote(str(CASE))")
 line('FIELDS = Path(r"D:', 'FIELDS = Path("fields").resolve()')
 line('KEEP = "/mnt', "KEEP = str(FIELDS)")
+if "--mesh-from" in FLAG:
+    if '--fixed-shape' not in sys.argv or URANS or MESH != 1 or any(a.startswith(('--morph','--подвижная','--только-сетка')) for a in sys.argv):
+        sys.exit('cs.py: --mesh-from requires --fixed-shape, steady CFD and no remeshing options')
+    mesh_source = Path(FLAG['--mesh-from']).resolve()
+    case_source = (Path.cwd()/'case').resolve()
+    if mesh_source.is_relative_to(case_source):
+        sys.exit('cs.py: --mesh-from must be outside the destination case')
+    required = ['points','faces','owner','neighbour','boundary']
+    if not all((mesh_source/n).is_file() or (mesh_source/(n+'.gz')).is_file() for n in required):
+        sys.exit('cs.py: --mesh-from needs a complete polyMesh')
+    sub('\nRUN = f"""',f'\nMESH_SOURCE = Path({str(mesh_source)!r})\nRUN = f"""')
+    sub('blockMesh                               > log.blockMesh 2>&1     || exit 11\n'
+        'snappyHexMesh -overwrite                > log.snappyHexMesh 2>&1 || exit 12',
+        'cp -r {quote(str(MESH_SOURCE))} constant/polyMesh || exit 11')
+    sub('splitMeshRegions -largestOnly -overwrite > log.split 2>&1        || exit 15',
+        'checkMesh > log.checkMesh.fixed 2>&1 || exit 12')
+    sub("echo CELLS=$(grep -oP 'cells:\\\\s*\\\\K[0-9]+' log.snappyHexMesh | tail -1)\n\"\"\"\n#: Проход на подвижной сетке",
+        "echo CELLS=$(grep -oP 'cells:\\\\s*\\\\K[0-9]+' log.checkMesh.fixed | head -1)\n\"\"\"\n#: Проход на подвижной сетке")
 # Три сценария: проход с перестройкой, только сетка, проход на подвижной сетке.
 sub("source /usr/lib/openfoam/openfoam2412/etc/bashrc\n", "", count=3)
 sub("pkill -f simpleFoam; pkill -f mpirun; sleep 2\n", "", count=2)
@@ -333,7 +351,14 @@ if SINK:
 
 # ---- проницаемая ткань: стенка с «вдувом-отсосом» (код граничного условия -- fabricU.txt)
 FABRIC = [float(x) for x in FLAG["--fabric"].split(",")] if "--fabric" in FLAG else None
+if FABRIC is not None:
+    if len(FABRIC)!=2 or not all(np.isfinite(x) and x>=0 for x in FABRIC) or not any(x>0 for x in FABRIC):
+        sys.exit('cs.py: --fabric requires two finite non-negative coefficients, at least one positive')
+    if SINK is not None:
+        sys.exit('cs.py: --fabric and --sink cannot be combined')
 RELAX = float(FLAG.get("--fabric-relax", 0.2))
+if not np.isfinite(RELAX) or not 0<RELAX<=1:
+    sys.exit('cs.py: --fabric-relax must satisfy 0 < value <= 1')
 FABRIC_TAN = float(FLAG.get("--fabric-tan", 0.0))
 if not 0.0 <= FABRIC_TAN <= 1.0:
     sys.exit("cs.py: --fabric-tan должен быть от 0 до 1")
@@ -374,10 +399,10 @@ if FLAG.get("--load") == "rings":
     if SINK or FLAG.get("--patch") or FLAG.get("--перенос") == "точный":
         sys.exit("cs.py: --load=rings требует круглый купол и обычный перенос нагрузки")
     sub("import vtp\n", "import vtp\nfrom ringload import ring_load\n")
-    sub("    relaxed = False\n",
+    sub("    relaxed = FIXED_SHAPE\n",
         '    ring_output = OUT / f"{NAME}_ringload_{step:02d}.npz"\n'
         "    structural_load = ring_load(mesh, folder, Q, KIN, ring_output)\n"
-        "    relaxed = False\n")
+        "    relaxed = FIXED_SHAPE\n")
     if "applied = attitude_reaction(mesh, load)" in src:
         sub("    applied = attitude_reaction(mesh, load) if HOLD is not None and HOLDER else load\n",
             "    applied = (attitude_reaction(mesh, structural_load)\n"

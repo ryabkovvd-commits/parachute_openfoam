@@ -37,8 +37,15 @@ if (now != stamp)
     {
         if (pair[i] < 0) continue;
         dp[i] = master ? pMe[i] - pThem[pair[i]] : pThem[pair[i]] - pMe[i];
-        scalar target = dp[i]/Dc;
-        if (Cw > SMALL) target = sign(dp[i])*(Foam::sqrt(sqr(Dc) + 4*Cw*mag(dp[i])) - Dc)/(2*Cw);
+        // Invert the surface law without cancellation or a provisional /Dc.
+        scalar target = 0.0;
+        if (mag(dp[i]) > 0.0)
+        {
+            if (Cw > 0.0)
+                target = sign(dp[i])*2.0*mag(dp[i])/(Dc + Foam::sqrt(sqr(Dc) + 4.0*Cw*mag(dp[i])));
+            else
+                target = dp[i]/Dc;
+        }
         Un[i] += lambda*(target - Un[i]);
     }
     if (master && now % 50 == 0)
