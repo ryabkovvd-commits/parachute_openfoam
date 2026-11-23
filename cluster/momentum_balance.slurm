@@ -4,7 +4,6 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=8G
 #SBATCH -t 02:00:00
 #SBATCH -o momentum-balance-%j.out
 set -eo pipefail
