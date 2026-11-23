@@ -176,7 +176,7 @@ def normal_diagnostics(args, run):
     return report
 
 
-def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, args, velocity, *, trace=None, pole_region=0.):
+def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, args, velocity, *, trace=None, pole_region=0., local_sampling=False):
     centres, area, normals, pressure = vtp.faces_of(path)
     if args.pressure_field != 'p':
         data = vtp.arrays(path)
@@ -205,7 +205,7 @@ def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, arg
         # the pole is displaced from the confluence axis or cell centres are
         # farther apart than the sector width. Keep local Euclidean neighbours
         # here; radial orientation and local normal checks remain mandatory.
-        if abs(r) <= pole_region+1e-12:
+        if local_sampling or abs(r) <= pole_region+1e-12:
             keep = valid.copy()
         # Closest centres may lie on small cut facets whose normals are almost
         # tangential to the intended canopy surface. Match the local surface too.
@@ -253,6 +253,7 @@ def extract(args, run):
     vent = args.vent_fraction if args.vent_fraction is not None else (1/(r+1) if pole is not None else .05)
     azimuth = np.radians(args.azimuth)
     pole_region = vent if pole is not None and not getattr(args,'strict_pole_sector',False) else 0.
+    local_sampling = bool(getattr(args,'local_sampling',False))
     first = ray_normal(grid, pole, azimuth, vent, args.subdivide, anchor)
     second = ray_normal(grid, pole, azimuth+np.pi, vent, args.subdivide, anchor)
     # Upstream skirt has smaller global z because the flow is in +z.
@@ -267,7 +268,7 @@ def extract(args, run):
     for name in ['master', 'slave']:
         trace = {}
         inside, value, distance, fraction, rejected = sample_patch(step/(name+'.vtp'), query, radius, query_normal,
-                                                                  anchor, axis, azimuth, args, velocity,trace=trace,pole_region=pole_region)
+                                                                  anchor, axis, azimuth, args, velocity,trace=trace,pole_region=pole_region,local_sampling=local_sampling)
         side = 'in' if inside else 'out'
         if side in pressures:
             raise ValueError('Both patches were classified as the same side of the fabric')
@@ -307,9 +308,10 @@ def extract(args, run):
                     pressure_field=args.pressure_field, pressure_reference_kinematic=args.p_inf,
                     pole=args.pole, vent_fraction=vent, meridian_azimuth_deg=float(np.degrees(azimuth)%360),
                     sector_half_width_deg=args.sector, neighbours=args.neighbours, diagnostics=diagnostics,
-                    closed_pole_sector_exemption_R=pole_region,
+                    closed_pole_sector_exemption_R=None if local_sampling else pole_region,
+                    sampling_method='local_3d_neighbours' if local_sampling else 'angular_sector',
                     local_normal_angle_limit_deg=args.normal_angle,
-                    sampling='Local inverse-distance interpolation with compatible normals; angular sector outside the closed-pole fan; no ring averaging',
+                    sampling='Nearest spatial inverse-distance samples with compatible normals; angular restriction per sampling_method; no ring averaging',
                     geometry='Smoothed CFD input surface; profile relative to mean skirt centre',
                     normal_filter='Requires >=99% consistent area orientation; opposite-oriented residual faces excluded only from pressure sampling. Folded/ambiguous surfaces require another method.',
                     compact_note='Compact table interpolated from full samples; terminal values rounded only for display',
@@ -429,7 +431,10 @@ def main(argv=None):
     parser.add_argument('--diagnose-normals',action='store_true',help='Report radial normal signs and their location; do not sample pressure or infer physical sides')
     parser.add_argument('--sampling-report',action='store_true',help='Print compact per-R distances in metres, including unfiltered nearest and interpolation support')
     parser.add_argument('--strict-pole-sector',action='store_true',help='Reproduce legacy angular filtering at every nonzero R, including the closed-pole fan')
+    parser.add_argument('--local-sampling',action='store_true',help='Use nearest compatible spatial faces at every query; no angular sector or ring averaging')
     args = parser.parse_args(argv)
+    if args.local_sampling and args.strict_pole_sector:
+        parser.error('--local-sampling and --strict-pole-sector select conflicting methods')
     if not np.isfinite(args.diameter) or args.diameter<=0 or args.neighbours<1 or not 0<args.sector<90 or args.subdivide<1 or not 0<args.normal_angle<90:
         parser.error('Invalid diameter or sampling parameters')
     if args.vent_fraction is not None and not 0<args.vent_fraction<1:

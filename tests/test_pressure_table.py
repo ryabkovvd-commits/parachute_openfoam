@@ -121,12 +121,14 @@ class MeridianTests(unittest.TestCase):
         triangles = np.vstack((self.triangles[:,::-1],np.arange(len(self.points),len(points))))
         pressure = np.r_[np.full(len(self.triangles),-50.),999999.]
         vtp_file(folder/'slave.vtp',points,triangles,pressure)
-        result = target.extract(self.args,self.run)
-        np.testing.assert_allclose(result.table[:,3],700/450,atol=1e-12)
-        self.assertEqual(result.metadata['diagnostics']['slave']['excluded_opposite_normal_faces'],0)
-        pole = result.sampling[np.argmin(np.abs(result.sampling[:,0]))]
-        self.assertLess(pole[15],pole[12]) # Raw closest facet is not the compatible closest one.
-        self.assertLess(pole[17],np.cos(np.radians(self.args.normal_angle)))
+        for local in [False,True]:
+            self.args.local_sampling=local
+            result = target.extract(self.args,self.run)
+            np.testing.assert_allclose(result.table[:,3],700/450,atol=1e-12)
+            self.assertEqual(result.metadata['diagnostics']['slave']['excluded_opposite_normal_faces'],0)
+            pole = result.sampling[np.argmin(np.abs(result.sampling[:,0]))]
+            self.assertLess(pole[15],pole[12]) # Raw closest facet is not the compatible closest one.
+            self.assertLess(pole[17],np.cos(np.radians(self.args.normal_angle)))
 
     def test_sampling_trace_and_compact_bracketing_distances(self):
         result = target.extract(self.args,self.run)
@@ -180,6 +182,26 @@ class MeridianTests(unittest.TestCase):
         outer=list(common);outer[2]=np.array([.6])
         unchanged=target.sample_patch(*outer,pole_region=1/13)
         np.testing.assert_allclose(unchanged[1],old[1])
+        spatial=target.sample_patch(*outer,pole_region=1/13,local_sampling=True)
+        np.testing.assert_allclose(spatial[1],new[1])
+        self.assertLess(spatial[2][0],.003)
+
+    def test_local_sampling_preserves_orientation_and_normal_guards(self):
+        self.args.local_sampling=True
+        result=target.extract(self.args,self.run)
+        self.assertEqual(result.metadata['sampling_method'],'local_3d_neighbours')
+        self.assertIsNone(result.metadata['closed_pole_sector_exemption_R'])
+        np.testing.assert_allclose(result.table[:,3],700/450,atol=1e-12)
+        # The stricter patch-side guard is not bypassed by a local stencil.
+        self.mixed_patch(self.run)
+        with self.assertRaisesRegex(ValueError,'ambiguous inside/outside'):
+            target.extract(self.args,self.run)
+
+    def test_cli_rejects_conflicting_sampling_modes(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                target.main([str(self.run),'--local-sampling','--strict-pole-sector'])
+        self.assertEqual(caught.exception.code,2)
 
     def test_closed_fan_change_preserves_outer_profile_and_legacy_mode(self):
         fixed=target.extract(self.args,self.run)
