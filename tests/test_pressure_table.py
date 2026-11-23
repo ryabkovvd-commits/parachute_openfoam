@@ -1,6 +1,9 @@
 """Numerical checks for pressure normalization, geometry and archive selection."""
 import base64
+import contextlib
+import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -127,6 +130,42 @@ class MeridianTests(unittest.TestCase):
         result = target.extract(self.args,self.run)
         self.assertEqual(result.metadata['pass_number'],6)
         self.assertTrue(result.metadata['input_shape'].endswith('проход05.npy'))
+
+    def mixed_patch(self,run):
+        folder = run/'fields/nos6_held/pass12/postProcessing/surfacePressure/2000'
+        triangles = self.triangles.copy()
+        corners = self.points[triangles]
+        area = .5*np.linalg.norm(np.cross(corners[:,1]-corners[:,0],corners[:,2]-corners[:,0]),axis=1)
+        number = int(np.searchsorted(np.cumsum(area),.05*area.sum())+1)
+        triangles[:number] = triangles[:number,::-1]
+        vtp_file(folder/'master.vtp',self.points,triangles,np.full(len(triangles),650.))
+
+    def test_diagnostic_does_not_relax_ambiguous_side_check(self):
+        self.mixed_patch(self.run)
+        with self.assertRaisesRegex(ValueError,'ambiguous inside/outside'):
+            target.extract(self.args,self.run)
+        self.args.pics = self.run/'normal_report'
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = target.normal_diagnostics(self.args,self.run)
+        stats = report['patches']['master']
+        self.assertTrue(.90<stats['positive_area_fraction']<.99)
+        self.assertGreater(stats['minority_faces'],0)
+        self.assertTrue(Path(stats['face_table']).is_file())
+        self.assertTrue(list(self.args.pics.glob('*.png')))
+        self.assertNotIn('side',stats)
+
+    def test_cli_preserves_successful_figures_when_other_case_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bad = Path(temp)/'bad'
+            shutil.copytree(self.run,bad)
+            self.mixed_patch(bad)
+            pics = Path(temp)/'comparison'
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    target.main([str(self.run),str(bad),'--V=30','--diameter=3','--subdivide=4',f'--pics={pics}'])
+            self.assertEqual(caught.exception.code,1)
+            self.assertTrue((pics/'pressure_meridians.png').is_file())
+            self.assertTrue((pics/'canopy_profiles.png').is_file())
 
 
 if __name__=='__main__':

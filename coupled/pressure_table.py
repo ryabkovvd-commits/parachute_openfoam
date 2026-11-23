@@ -117,6 +117,65 @@ def ray_normal(grid, pole, azimuth, vent, subdivide, anchor):
     return radius,curve,normal
 
 
+def normal_diagnostics(args, run):
+    """Report the radial-normal assumption without assigning physical sides.
+
+    A minority of radial signs can arise from cut facets or non-star-shaped
+    geometry. Neither cause can be identified from this sign test alone.
+    """
+    row, step, shape, velocity = locate(args,run)
+    pos = np.load(shape,allow_pickle=False)
+    count = (int(row['rings'])+1)*int(row['gores'])
+    expected = count+(2 if args.pole=='closed' else 1)
+    if pos.shape!=(expected,3) or not np.isfinite(pos).all():
+        raise ValueError('Input shape does not match the selected topology')
+    anchor = pos[count]
+    theta = np.radians(float(row['hold']))
+    axis = np.array([np.sin(theta),0.,np.cos(theta)])
+    e1 = np.array([np.cos(theta),0.,-np.sin(theta)])
+    folder = args.pics or run/'pics'
+    folder.mkdir(parents=True,exist_ok=True)
+    report = dict(run=str(run),pass_number=int(row['pass']),angle_deg=float(row['hold']),
+                  input_shape=str(shape),surface=str(step),patches={},
+                  note='Radial signs relative to confluence, not a proof of inside/outside or self-intersection. No pressure sampling or CFD changes.')
+    fig,axes = plt.subplots(1,2,figsize=(11,5),sharex=True,sharey=True)
+    stem = f"{args.name}_normals_pass{int(row['pass']):02d}"
+    stem += '_'+re.sub(r'[^\w.-]+','_',run.parent.name+'_'+run.name)
+    for ax,name in zip(axes,['master','slave']):
+        centres,area,normals,_ = vtp.faces_of(step/(name+'.vtp'))
+        if area.sum()<=0 or not np.isfinite(centres).all() or not np.isfinite(normals).all():
+            raise ValueError(f'{name}: invalid face geometry')
+        projection = np.einsum('ij,ij->i',normals,centres-anchor)
+        positive = projection>0
+        fraction = float(area[positive].sum()/area.sum())
+        majority_positive = fraction>=.5
+        minority = (positive!=majority_positive) | (projection==0) | (area<=0)
+        relative = centres-anchor
+        xb, hb = relative@e1/args.diameter, relative@axis/args.diameter
+        stats = dict(faces=len(area),positive_area_fraction=fraction,
+                     minority_faces=int(minority.sum()),minority_area_fraction=float(area[minority].sum()/area.sum()),
+                     minority_x_positive_faces=int((minority & (xb>=0)).sum()),
+                     minority_x_negative_faces=int((minority & (xb<0)).sum()))
+        report['patches'][name] = stats
+        table = folder/(stem+'_'+name+'.csv')
+        with table.open('w',encoding='utf-8',newline='') as stream:
+            writer=csv.writer(stream)
+            writer.writerow(['face','minority_radial_sign','area_m2','n_dot_r_m','x_body_D0','h_from_confluence_D0','x_m','y_m','z_m'])
+            writer.writerows((i,int(minority[i]),area[i],projection[i],xb[i],hb[i],*centres[i]) for i in range(len(area)))
+        stats['face_table']=str(table)
+        ax.scatter(xb[~minority],hb[~minority],s=1,color='.65',rasterized=True,label='Преобладающий радиальный знак')
+        ax.scatter(xb[minority],hb[minority],s=4,color='#b2182b',rasterized=True,label='Противоположный знак / нулевая грань')
+        ax.set_title(f"{name}: противоположная площадь {100*stats['minority_area_fraction']:.2f}%")
+        ax.set_xlabel('x′ / D₀');ax.grid(alpha=.2);ax.set_aspect('equal',adjustable='box')
+        print(f"{name}: faces={len(area)}, positive_area={fraction:.6f}, minority_faces={stats['minority_faces']}, minority_area={stats['minority_area_fraction']:.6f}")
+    axes[0].set_ylabel('h от коуша / D₀');axes[0].legend(fontsize=7)
+    fig.suptitle(f"Проверка радиального знака нормалей · α = {report['angle_deg']:g}°")
+    fig.tight_layout(rect=[0,0,1,.95]);fig.savefig(folder/(stem+'.png'),dpi=160);plt.close(fig)
+    (folder/(stem+'.json')).write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    print(f'Диагностика сохранена: {folder/stem}')
+    return report
+
+
 def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, args, velocity):
     centres, area, normals, pressure = vtp.faces_of(path)
     if args.pressure_field != 'p':
@@ -129,7 +188,8 @@ def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, arg
     projection = np.einsum('ij,ij->i', normals, centres-centre)
     positive = float(area[projection > 0].sum()/area.sum())
     if .01 < positive < .99:
-        raise ValueError(f'{path}: ambiguous inside/outside normals ({positive:.1%} positive)')
+        raise ValueError(f'{path}: ambiguous inside/outside normals ({positive:.1%} positive); '
+                         'run --diagnose-normals to inspect this geometric assumption. Do not swap pressure sides by guessing.')
     inside = positive >= .99
     valid = ((projection > 0) == inside) & (area > 0)
     rejected = int((~valid).sum())
@@ -253,13 +313,14 @@ def plot_results(results, args, folder):
     profile, ax_shape = plt.subplots(figsize=(7,5.5))
     for number, result in enumerate(results):
         data, meta = result.table, result.metadata
+        case_label = result.run.parent.name+'/'+result.run.name
         ax_p, ax_dp = axes[number]
         keep = [data[:,0]<=0, data[:,0]>=0] if meta['pole']=='open' else [np.ones(len(data),dtype=bool)]
         for branch_index, mask in enumerate(keep):
             for j, label, color in [(1,'Внутри','#2166ac'),(2,'Снаружи','#b2182b')]:
                 ax_p.plot(data[mask,0],data[mask,j],color=color,label=label if branch_index==0 else None)
             ax_dp.plot(data[mask,0],data[mask,3],color='#333333',label='OpenFOAM' if branch_index==0 else None)
-            ax_shape.plot(data[mask,4],data[mask,5],label=f"α = {meta['angle_deg']:g}°" if branch_index==0 else None,
+            ax_shape.plot(data[mask,4],data[mask,5],label=f"{case_label}: α = {meta['angle_deg']:g}°" if branch_index==0 else None,
                           color=plt.get_cmap('tab10')(number%10))
         ref = reference_data(args.reference,meta['angle_deg'])
         if ref is not None:
@@ -268,8 +329,8 @@ def plot_results(results, args, folder):
                               label='Носарев: '+('внутри' if j==1 else 'снаружи'))
             ax_dp.errorbar(ref[:,0],ref[:,3],yerr=.05,fmt='o',mfc='white',color='#dd8d00',ms=4,capsize=2,
                            label='Носарев, предварительная оцифровка')
-        ax_p.set_title(f"Давление, α = {meta['angle_deg']:g}°, проход {meta['pass_number']}")
-        ax_dp.set_title(f"Перепад давления, α = {meta['angle_deg']:g}°")
+        ax_p.set_title(f"{case_label} · α = {meta['angle_deg']:g}°, проход {meta['pass_number']}")
+        ax_dp.set_title(f"Перепад давления · {case_label} · α = {meta['angle_deg']:g}°")
         for ax in [ax_p, ax_dp]:
             ax.set_xlabel('R: −1 — передняя кромка; 0 — полюс; +1 — задняя')
             ax.grid(alpha=.25)
@@ -316,6 +377,7 @@ def main(argv=None):
     parser.add_argument('--fields-dir',type=Path)
     parser.add_argument('--pics',type=Path)
     parser.add_argument('--reference',type=Path,help='Optional preliminary digitization CSV, not raw experimental measurements')
+    parser.add_argument('--diagnose-normals',action='store_true',help='Report radial normal signs and their location; do not sample pressure or infer physical sides')
     args = parser.parse_args(argv)
     if not np.isfinite(args.diameter) or args.diameter<=0 or args.neighbours<1 or not 0<args.sector<90 or args.subdivide<1 or not 0<args.normal_angle<90:
         parser.error('Invalid diameter or sampling parameters')
@@ -323,12 +385,17 @@ def main(argv=None):
         parser.error('--vent-fraction must be between zero and one')
     if len(args.runs)>1 and any([args.shape,args.surface_dir,args.out_dir,args.fields_dir]):
         parser.error('Explicit shape/surface/out/fields paths require a single run')
-    results = []
+    results, errors = [], []
     for run in args.runs:
         try:
+            if args.diagnose_normals:
+                normal_diagnostics(args,run)
+                continue
             result = extract(args,run)
         except (OSError,ValueError,KeyError) as error:
-            parser.exit(1,f'{run}: {error}\n')
+            errors.append(f'{run}: {error}')
+            print(errors[-1],file=sys.stderr)
+            continue
         folder = args.pics or run/'pics'
         folder.mkdir(parents=True,exist_ok=True)
         suffix = re.sub(r'[^\w.-]+','_',run.parent.name+'_'+run.name) if len(args.runs)>1 else ''
@@ -344,7 +411,10 @@ def main(argv=None):
             print(f'Диагностика: исключено из выборки {removed} граней с противоположной ориентацией; подробности в metadata.json')
         print(f'CSV и параметры: {folder}')
         results.append(result)
-    plot_results(results,args,args.pics or results[0].run/'pics')
+    if results:
+        plot_results(results,args,args.pics or results[0].run/'pics')
+    if errors:
+        parser.exit(1,'Some cases could not be processed; valid-case figures were saved where available.\n')
     return results
 
 
