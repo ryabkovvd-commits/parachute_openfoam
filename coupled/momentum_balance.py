@@ -44,10 +44,12 @@ def integrate_boundary(rows,rho,origin):
     if np.any(area<=0): raise ValueError('Non-positive boundary face area')
     normals=s/area[:,None]
     normal_u=np.einsum('ij,ij->i',u,normals)[:,None]*normals
+    flux_difference=phi-np.einsum('ij,ij->i',u,s)
     terms=dict(pressure=rho*p[:,None]*s,viscous=-rho*tau,
                convection=rho*phi[:,None]*u,
                convection_normal=rho*phi[:,None]*normal_u,
-               convection_tangential=rho*phi[:,None]*(u-normal_u))
+               convection_tangential=rho*phi[:,None]*(u-normal_u),
+               phi_U_flux_difference=rho*flux_difference[:,None]*u)
     groups={}
     names=np.array([row['patch'] for row in rows])
     if not {'canopy','canopy_slave'}.issubset(set(names)):
@@ -110,6 +112,43 @@ def form_balance(groups,cords,q,s0,diameter):
     return result
 
 
+def read_operators(path,rho):
+    rows=read_csv(path)
+    result={}
+    for row in rows:
+        key=row['quantity']
+        if key in result: raise ValueError('Duplicate volume operator')
+        a=vector_columns([row],['fx_kin','fy_kin','fz_kin','mx_kin','my_kin','mz_kin']).ravel()*rho
+        result[key]=dict(force_N=a[:3].tolist(),moment_Nm=a[3:].tolist(),
+                         force_L1_N=float(row['force_L1_kin'])*rho)
+    required={'pressure_limited','pressure_frozen','pressure_gauss','convection_bounded',
+              'convection_conservative','viscous_discrete'}
+    if not required.issubset(result):
+        raise ValueError('Exporter needs updating: volume operators are missing')
+    return result
+
+
+def operator_balance(groups,cords,operators,balance):
+    """Decompose surface-CV minus cell-operator residual, without fitting a correction."""
+    result={}
+    for quantity in ['force_N','moment_Nm']:
+        def op(name): return np.array(operators[name][quantity])
+        def surface(name): return np.array(groups['all'][name+'_'+quantity])
+        cord=np.array(cords['force_N' if quantity=='force_N' else 'moment_at_cells_Nm'])
+        discrete=op('pressure_limited')+op('convection_bounded')+op('viscous_discrete')+cord
+        pressure_gap=surface('pressure')-op('pressure_limited')
+        convection_gap=surface('convection')-op('convection_bounded')
+        viscous_gap=surface('viscous')-op('viscous_discrete')
+        original=np.array(balance[quantity]['residual'])
+        result[quantity]=dict(discrete_residual=discrete.tolist(),pressure_gap=pressure_gap.tolist(),
+            pressure_limiter_effect=(op('pressure_limited')-op('pressure_gauss')).tolist(),
+            pressure_gauss_geometry_gap=(surface('pressure')-op('pressure_gauss')).tolist(),
+            pressure_passive_flag_effect=(op('pressure_limited')-op('pressure_frozen')).tolist(),
+            convection_gap=convection_gap.tolist(),viscous_gap=viscous_gap.tolist(),
+            identity_error=(original-discrete-pressure_gap-convection_gap-viscous_gap).tolist())
+    return result
+
+
 def native_force_record(path,time):
     if not path.is_file(): return None
     records=[]
@@ -166,6 +205,8 @@ def snapshot_sources(work,row):
 def run_case(work,binary):
     config,manifest,row=permeability.verify(work)
     time,fields,extra,archive=snapshot_sources(work,row)
+    if not re.search(r'div\s*\(\s*phi\s*,\s*U\s*\)\s+bounded\b',extra['schemes'].read_text(encoding='utf-8')):
+        raise ValueError('The volume-operator audit expects the current bounded div(phi,U) scheme')
     turbulence=work/'case/constant/turbulenceProperties'
     if not re.search(r'\bRASModel\s+kOmegaSST\s*;',turbulence.read_text(encoding='utf-8')):
         raise ValueError('This stress reconstruction is restricted to the current kOmegaSST cases')
@@ -221,13 +262,18 @@ def run_case(work,binary):
     q=.5*rho*speed**2
     balance=form_balance(groups,cords,q,float(row['S0']),diameter)
     volume={r['quantity']:[float(r[k]) for k in ['x','y','z']] for r in read_csv(output/'volume.csv')}
-    for key in ['bounded_force_kin','bounded_moment_kin']: volume[key]=[rho*v for v in volume[key]]
+    volume['bounded_force_N']=[rho*v for v in volume['bounded_force_kin']]
+    volume['bounded_moment_Nm']=[rho*v for v in volume['bounded_moment_kin']]
+    operators=read_operators(output/'operators.csv',rho)
+    decomposition=operator_balance(groups,cords,operators,balance)
     force=native_force_record(archive/'postProcessing/forces/0/force.dat',float(time))
     moment=native_force_record(archive/'postProcessing/forces/0/moment.dat',float(time))
     if force is None: force=native_force_record(work/'case/postProcessing/forces/0/force.dat',float(time))
     if moment is None: moment=native_force_record(work/'case/postProcessing/forces/0/moment.dat',float(time))
     report=dict(model=config['name'],time=float(time),rho=rho,speed=speed,diameter=diameter,
                 origin=[0.,0.,0.],groups=groups,cords=cords,balance=balance,volume=volume,
+                operators=operators,operator_balance=decomposition,audit_format_version=2,
+                pressure_operator_note='Passive zeroGradient flags are restored for the pressure limiter. Mixed/freestreamPressure fixesValue flags and stored values are retained; no original coded velocity boundary is evaluated.',
                 native_forces_function=dict(force=force,moment=moment),
                 reference_history=dict(mz=row['mz'],cx=row['cx'],cy=row['cy'],cord_mz=row['cord_mz']),
                 input_sha256=before,mesh_sha256=mesh_before,inputs_unchanged=unchanged,
@@ -248,7 +294,7 @@ def compact(report):
     def coeff(key): return b[key][1]/scale
     g=report['groups']
     native=report['native_forces_function']['moment']
-    return dict(model=report['model'],mz_history=report['reference_history']['mz'],
+    row=dict(model=report['model'],mz_history=report['reference_history']['mz'],
                 mz_pressure=coeff('interface_pressure'),mz_viscous=coeff('interface_viscous'),
                 mz_convection=coeff('interface_convection'),
                 mz_convection_tangential=g['interface']['convection_tangential_moment_Nm'][1]/scale,
@@ -263,6 +309,19 @@ def compact(report):
                 Q_mismatch_U_phi=g['all']['phi_minus_U_dot_Sf_L1_m3_s'],
                 continuity_L1=report['volume']['continuity_l1'][0],
                 cord_recomputed_force_difference=report['cords']['force_recomputed_difference_relative'])
+    if 'operator_balance' in report:
+        ops=report['operator_balance']['moment_Nm']
+        for key in ['discrete_residual','pressure_gap','pressure_limiter_effect','pressure_gauss_geometry_gap',
+                    'pressure_passive_flag_effect','convection_gap','viscous_gap','identity_error']:
+            row['mz_'+key]=ops[key][1]/scale
+        f=report['operator_balance']['force_N']['discrete_residual']
+        fscale=report['balance']['force_N']['normalization']
+        row['cx_discrete_residual']=f[2]/fscale
+        row['cy_discrete_residual']=f[0]/fscale
+        row['Q_mismatch_outer']=g['outer']['phi_minus_U_dot_Sf_L1_m3_s']
+        row['Q_mismatch_interface']=g['interface']['phi_minus_U_dot_Sf_L1_m3_s']
+        row['mz_outer_UdotSf_minus_phi']=g['outer']['phi_U_flux_difference_moment_Nm'][1]/scale
+    return row
 
 
 def main(argv=None):
@@ -275,6 +334,8 @@ def main(argv=None):
     root=args.root.resolve()
     summary=root/'momentum_balance.csv'
     if summary.exists(): summary.unlink()
+    operator_summary=root/'momentum_operators.csv'
+    if operator_summary.exists(): operator_summary.unlink()
     rows=[]
     failed=False
     for model in args.model or ['df','darcy','quadratic']:
@@ -287,6 +348,9 @@ def main(argv=None):
                   f"mz_conv={row['mz_convection']:+.6f} mz_outer={row['mz_outer']:+.6f} "
                   f"residual={row['mz_balance_residual']:+.3e}",flush=True)
             print(f"  Q canopy/slave/all: {row['Q_canopy']:+.6g} {row['Q_slave']:+.6g} {row['Q_all']:+.3e}",flush=True)
+            print(f"  operators {model}: discrete={row['mz_discrete_residual']:+.3e} "
+                  f"pressure_gap={row['mz_pressure_gap']:+.3e} limiter={row['mz_pressure_limiter_effect']:+.3e} "
+                  f"convection_gap={row['mz_convection_gap']:+.3e} viscous_gap={row['mz_viscous_gap']:+.3e}",flush=True)
         except (OSError,ValueError,KeyError,RuntimeError) as error:
             failed=True
             print(f'{model}: ERROR: {error}',flush=True)
@@ -296,6 +360,13 @@ def main(argv=None):
             writer=csv.DictWriter(stream,fieldnames=list(rows[0]))
             writer.writeheader(); writer.writerows(rows)
         print(path)
+        columns=['model','mz_balance_residual','mz_discrete_residual','mz_pressure_gap',
+                 'mz_pressure_limiter_effect','mz_pressure_gauss_geometry_gap',
+                 'mz_convection_gap','mz_viscous_gap','mz_outer_UdotSf_minus_phi']
+        with operator_summary.open('w',encoding='utf-8-sig',newline='') as stream:
+            writer=csv.DictWriter(stream,fieldnames=columns,extrasaction='ignore')
+            writer.writeheader();writer.writerows(rows)
+        print(operator_summary)
     return int(failed)
 
 

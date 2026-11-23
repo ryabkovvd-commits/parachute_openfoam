@@ -54,6 +54,26 @@ class MomentumTests(unittest.TestCase):
         groups=audit.integrate_boundary(rows,1.,[0,0,0])
         self.assertEqual(groups['all']['volume_flux_m3_s'],1.)
         self.assertEqual(groups['all']['phi_minus_U_dot_Sf_L1_m3_s'],1.)
+        np.testing.assert_allclose(groups['all']['phi_U_flux_difference_force_N'],[0,0,3])
+
+    def test_operator_decomposition_separates_pressure_limiter_and_surface_gap(self):
+        rows=[face('canopy',(0,0,1),(0,0,1),(0,0,0),0),
+              face('canopy_slave',(0,0,1),(0,0,-1),(0,0,0),0),
+              face('farfield',(0,0,0),(1,0,0),(0,0,0),0)]
+        groups=audit.integrate_boundary(rows,1.,[0,0,0])
+        cords=dict(force_N=[0,0,0],moment_at_cells_Nm=[0,0,0])
+        balance=audit.form_balance(groups,cords,1.,1.,1.)
+        names=['pressure_limited','pressure_frozen','pressure_gauss','convection_bounded','convection_conservative','viscous_discrete']
+        operators={n:dict(force_N=[0.,0.,0.],moment_Nm=[0.,0.,0.]) for n in names}
+        operators['pressure_limited']=dict(force_N=[1.,0.,0.],moment_Nm=[0.,3.,0.])
+        operators['pressure_frozen']=dict(force_N=[1.,0.,0.],moment_Nm=[0.,2.,0.])
+        result=audit.operator_balance(groups,cords,operators,balance)
+        np.testing.assert_allclose(result['moment_Nm']['discrete_residual'],[0,3,0])
+        np.testing.assert_allclose(result['moment_Nm']['pressure_gap'],[0,-3,0])
+        np.testing.assert_allclose(result['moment_Nm']['pressure_limiter_effect'],[0,3,0])
+        np.testing.assert_allclose(result['moment_Nm']['pressure_passive_flag_effect'],[0,1,0])
+        for quantity in ['force_N','moment_Nm']:
+            np.testing.assert_allclose(result[quantity]['identity_error'],0)
 
     def test_cord_source_cell_and_structural_point_moments_differ(self):
         mapping=[dict(sample=0,cell=1,cx=0,cy=0,cz=2,x=0,y=0,z=1,rx_kin=1,ry_kin=0,rz_kin=0)]
@@ -92,6 +112,8 @@ class MomentumTests(unittest.TestCase):
             binary.touch()
             summary=root/'momentum_balance.csv'
             summary.write_text('old success')
+            old_operators=root/'momentum_operators.csv'
+            old_operators.write_text('old operators')
             old_report=root/'df/out/momentum_balance/report.json'
             old_report.parent.mkdir(parents=True)
             old_report.write_text('{"old":"success"}')
@@ -99,6 +121,7 @@ class MomentumTests(unittest.TestCase):
                 status=audit.main([str(root),'--binary',str(binary)])
             self.assertEqual(status,1)
             self.assertFalse(summary.exists())
+            self.assertFalse(old_operators.exists())
             self.assertFalse(old_report.exists())
 
     def test_wrapper_stages_inputs_and_produces_report_without_changing_sources(self):
@@ -110,7 +133,7 @@ class MomentumTests(unittest.TestCase):
             for n in audit.permeability.CORE: (case/'constant/polyMesh'/n).write_text('mesh fixture')
             for n in ['U','p','phi','nut']: (case/'2000'/n).write_text('stored field '+n)
             (case/'system/controlDict').write_text('application simpleFoam; functions { MUST_NOT_COPY; }')
-            (case/'system/fvSchemes').write_text('original schemes')
+            (case/'system/fvSchemes').write_text('divSchemes { div(phi,U) bounded Gauss linearUpwind grad(U); }')
             (case/'system/fvSolution').write_text('original solution settings')
             (case/'constant/turbulenceProperties').write_text('RAS { RASModel kOmegaSST; }')
             (case/'constant/cords').write_text('2 ((0 0 0)(0 0 1))')
@@ -131,6 +154,11 @@ class MomentumTests(unittest.TestCase):
                 with (output/'boundary.csv').open('w',newline='') as stream:
                     writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
                 (output/'volume.csv').write_text('quantity,x,y,z\ncontinuity_l1,0,0,0\ncontinuity_net,0,0,0\nbounded_force_kin,0,0,0\nbounded_moment_kin,0,0,0\n')
+                with (output/'operators.csv').open('w',newline='') as stream:
+                    writer=csv.writer(stream)
+                    writer.writerow(['quantity','fx_kin','fy_kin','fz_kin','mx_kin','my_kin','mz_kin','force_L1_kin'])
+                    writer.writerows([[n,0,0,0,0,0,0,0] for n in ['pressure_limited','pressure_frozen','pressure_gauss',
+                                                                              'convection_bounded','convection_conservative','viscous_discrete']])
                 with (output/'cord_mapping.csv').open('w',newline='') as stream:
                     writer=csv.writer(stream)
                     writer.writerow(['sample','cell','cx','cy','cz','x','y','z','rx_kin','ry_kin','rz_kin'])
@@ -141,6 +169,8 @@ class MomentumTests(unittest.TestCase):
             self.assertEqual(result['mz_balance_residual'],0.)
             report=json.loads((work/'out/momentum_balance/report.json').read_text())
             self.assertTrue(report['inputs_unchanged'])
+            self.assertEqual(report['audit_format_version'],2)
+            self.assertEqual(result['mz_identity_error'],0.)
             self.assertIn('MUST_NOT_COPY',(case/'system/controlDict').read_text())
 
 

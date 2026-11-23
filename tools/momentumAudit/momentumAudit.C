@@ -6,6 +6,8 @@
 #include "IFstream.H"
 #include "IStringStream.H"
 #include "OStringStream.H"
+#include "gaussGrad.H"
+#include "zeroGradientFvPatchFields.H"
 
 using namespace Foam;
 
@@ -72,6 +74,18 @@ dictionary frozenDictionary
 void csvVector(Ostream& os,const vector& v)
 {
     os << ',' << v.x() << ',' << v.y() << ',' << v.z();
+}
+
+void volumeIntegral(Ostream& os,const word& name,const volVectorField& field,const fvMesh& mesh)
+{
+    vector force(Zero),moment(Zero);
+    scalar l1=0;
+    forAll(mesh.V(),i)
+    {
+        const vector f=mesh.V()[i]*field[i];
+        force+=f; moment+=mesh.C()[i]^f; l1+=mag(f);
+    }
+    os << name; csvVector(os,force); csvVector(os,moment); os << ',' << l1 << '\n';
 }
 
 int main(int argc,char* argv[])
@@ -150,6 +164,70 @@ int main(int argc,char* argv[])
     volume << "quantity,x,y,z\ncontinuity_l1," << l1 << ",0,0\ncontinuity_net," << net << ",0,0\n";
     volume << "bounded_force_kin"; csvVector(volume,boundedForce); volume << '\n';
     volume << "bounded_moment_kin"; csvVector(volume,boundedMoment); volume << '\n';
+
+    // Preserve pressure's passive zeroGradient flags for the cell limiter.
+    // freestreamPressure derives from mixed (fixesValue=true); its stored
+    // value is retained without evaluating it. The coded velocity BC stays frozen.
+    volScalarField pressureOperator
+    (
+        IOobject("auditOperatorP",runTime.timeName(),mesh,IOobject::NO_READ,IOobject::NO_WRITE),p
+    );
+    {
+        IOdictionary original
+        (
+            IOobject("p",runTime.timeName(),mesh,IOobject::MUST_READ,IOobject::NO_WRITE,false),
+            word("volScalarField")
+        );
+        const dictionary& patches=original.subDict("boundaryField");
+        forAll(mesh.boundary(),patchi)
+        {
+            const fvPatch& patch=mesh.boundary()[patchi];
+            const word type=patches.subDict(patch.name()).get<word>("type");
+            if (type=="zeroGradient")
+            {
+                pressureOperator.boundaryFieldRef().set
+                (
+                    patchi,new zeroGradientFvPatchScalarField(patch,pressureOperator.internalField())
+                );
+                pressureOperator.boundaryFieldRef()[patchi] == p.boundaryField()[patchi];
+            }
+            else if (type!="fixedValue" && type!="freestreamPressure" && type!="mixed")
+                FatalErrorInFunction << "Unsupported pressure limiter flags for " << type << exit(FatalError);
+        }
+    }
+    tmp<fv::gradScheme<scalar>> pressureScheme
+    (
+        fv::gradScheme<scalar>::New(mesh,mesh.gradScheme("grad(p)"))
+    );
+    const volVectorField pressureLimited
+    (
+        pressureScheme().calcGrad(pressureOperator,"auditGradPOriginalFlags")
+    );
+    const volVectorField pressureFrozen
+    (
+        pressureScheme().calcGrad(p,"auditGradPFrozenFlags")
+    );
+    const volVectorField pressureGauss
+    (
+        fv::gaussGrad<scalar>(mesh).calcGrad(pressureOperator,"auditGradPGauss")
+    );
+    const volVectorField convectionBounded(fvc::div(phi,U));
+    const volVectorField convectionConservative(convectionBounded+U*divergence);
+    const volScalarField nuEff("auditNuEff",dimensionedScalar("nu",dimViscosity,nu)+nut);
+    const volVectorField viscousDiscrete
+    (
+        -fvc::laplacian(nuEff,U,"laplacian(nuEff,U)")
+        -fvc::div(nuEff*dev2(T(gradient)),"div((nuEff*dev2(T(grad(U)))))")
+    );
+    OFstream operators(output/"operators.csv");
+    operators.precision(17);
+    operators << "quantity,fx_kin,fy_kin,fz_kin,mx_kin,my_kin,mz_kin,force_L1_kin\n";
+    volumeIntegral(operators,"pressure_limited",pressureLimited,mesh);
+    volumeIntegral(operators,"pressure_frozen",pressureFrozen,mesh);
+    volumeIntegral(operators,"pressure_gauss",pressureGauss,mesh);
+    volumeIntegral(operators,"convection_bounded",convectionBounded,mesh);
+    volumeIntegral(operators,"convection_conservative",convectionConservative,mesh);
+    volumeIntegral(operators,"viscous_discrete",viscousDiscrete,mesh);
 
     IFstream cordInput(mesh.time().path()/mesh.time().constant()/"cords");
     if (!cordInput.good())
