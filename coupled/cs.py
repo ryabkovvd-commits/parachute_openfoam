@@ -11,6 +11,7 @@
     --load=rings  осреднить перепад по поясам только для механики оболочки
     --fabric-tan=K доля касательной скорости со стороны отсоса на стороне выдува
     --nu=NU       вязкость, м2/с (1.46e-5); 1.03e-4 -- Re модели Носарева Dп 2.76 м
+    --pressure-gradient=gauss  только grad(p) Gauss linear; прочие градиенты прежние
     --urans=T     pimpleFoam на T секунд; силы -- среднее по второй половине
     --patch=имя   дополнительные правки из coupled/имя.py (mks3 -- купол опыта 1980)
     --fabric=D,CW ткань -- стенка с «вдувом-отсосом»: нормальная скорость сквозь
@@ -114,6 +115,16 @@ sub("type cuttingPlane;  point (0 0 0);  normal (0 1 0);",
 MODE = []
 MODE.append("V = " + FLAG.get("--V", "9.0") + " м/с")
 MODE.append("nu = " + FLAG.get("--nu", "1.46e-5") + " м2/с")
+PRESSURE_GRADIENT = FLAG.get('--pressure-gradient','default')
+if PRESSURE_GRADIENT not in {'default','gauss'}:
+    sys.exit('cs.py: --pressure-gradient accepts default or gauss')
+sub('        "mesh_source": FLAGS.get(\'--mesh-from\'),\n',
+    '        "mesh_source": FLAGS.get(\'--mesh-from\'),\n'
+    f'        "pressure_gradient": {PRESSURE_GRADIENT!r},\n')
+if PRESSURE_GRADIENT=='gauss':
+    sub('gradSchemes { default cellLimited Gauss linear 1; }',
+        'gradSchemes { default cellLimited Gauss linear 1; grad(p) Gauss linear; }')
+    MODE.append('Градиент давления: grad(p) Gauss linear; остальные градиенты без изменения')
 
 if "--shape-tol" in FLAG:
     try:
