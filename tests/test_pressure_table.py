@@ -158,6 +158,40 @@ class MeridianTests(unittest.TestCase):
         self.assertIn('near_out_m',lines[0])
         self.assertEqual(len([s for s in captured.getvalue().splitlines() if s.startswith('sample_max ')]),2)
 
+    def test_near_axis_fan_query_uses_local_faces_instead_of_distant_sector(self):
+        centres=np.array([[.001,.001,2],[.002,.001,2],[.003,.001,2],[.002,.002,2],
+                          [-.19,0,2],[-.195,0,2],[-.20,0,2],[-.205,0,2]])
+        offsets=np.array([[-1e-4,-1e-4,0],[1e-4,-1e-4,0],[0,2e-4,0]])
+        points=(centres[:,None,:]+offsets).reshape(-1,3)
+        triangles=np.arange(len(points)).reshape(-1,3)
+        path=self.run/'near_axis.vtp'
+        vtp_file(path,points,triangles,np.r_[np.full(4,650.),np.full(4,-50.)])
+        self.args.p_inf=0.
+        common=(path,np.array([[.002,0,2.]]),np.array([.00641]),np.array([[0,0,1.]]),
+                np.zeros(3),np.array([0,0,1.]),0.,self.args,30.)
+        old_trace,new_trace={},{}
+        old=target.sample_patch(*common,trace=old_trace)
+        new=target.sample_patch(*common,trace=new_trace,pole_region=1/13)
+        self.assertGreater(old[2][0],.18)
+        self.assertLess(new[2][0],.003)
+        np.testing.assert_allclose(old[1],-50/450)
+        np.testing.assert_allclose(new[1],650/450)
+        # Outside the closed fan the same angular sector must still apply.
+        outer=list(common);outer[2]=np.array([.6])
+        unchanged=target.sample_patch(*outer,pole_region=1/13)
+        np.testing.assert_allclose(unchanged[1],old[1])
+
+    def test_closed_fan_change_preserves_outer_profile_and_legacy_mode(self):
+        fixed=target.extract(self.args,self.run)
+        self.args.strict_pole_sector=True
+        old=target.extract(self.args,self.run)
+        fan=fixed.metadata['closed_pole_sector_exemption_R']
+        self.assertAlmostEqual(fan,1/(self.r+1))
+        self.assertEqual(old.metadata['closed_pole_sector_exemption_R'],0.)
+        mask=(abs(fixed.table[:,0])>fan+1e-12) | (abs(fixed.table[:,0])<1e-12)
+        np.testing.assert_allclose(fixed.table[mask],old.table[mask],atol=0,rtol=0)
+        np.testing.assert_allclose(fixed.sampling[mask],old.sampling[mask],atol=0,rtol=0)
+
     def test_explicit_pass_selection(self):
         self.args.pass_number = 6
         result = target.extract(self.args,self.run)
