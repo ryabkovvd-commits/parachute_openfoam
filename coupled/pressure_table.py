@@ -176,7 +176,7 @@ def normal_diagnostics(args, run):
     return report
 
 
-def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, args, velocity):
+def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, args, velocity, *, trace=None):
     centres, area, normals, pressure = vtp.faces_of(path)
     if args.pressure_field != 'p':
         data = vtp.arrays(path)
@@ -196,7 +196,7 @@ def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, arg
     radial = centres-centre
     e1 = np.array([axis[2], 0., -axis[0]])
     azimuth = np.arctan2(radial[:, 1], radial @ e1)
-    values, distances = [], []
+    values, distances, selection = [], [], []
     for point, r, expected_normal in zip(query, query_r, query_normal):
         phi = meridian if r < 0 else meridian+np.pi
         delta = np.angle(np.exp(1j*(azimuth-phi)))
@@ -210,12 +210,17 @@ def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, arg
         candidates = np.flatnonzero(keep)
         if len(candidates) < args.neighbours:
             raise ValueError('Not enough compatible faces near the meridian; inspect geometry or adjust --sector/--normal-angle')
-        distance = np.linalg.norm(centres[candidates]-point, axis=1)
+        all_distance = np.linalg.norm(centres-point, axis=1)
+        distance = all_distance[candidates]
         order = np.argsort(distance)[:args.neighbours]
         selected, ds = candidates[order], distance[order]
         weight = 1/np.maximum(ds, 1e-12)
         values.append(float(np.average(pressure[selected], weights=weight)))
         distances.append(float(ds[0]))
+        raw = int(np.argmin(all_distance))
+        selection.append([int(selected[0]),ds[0],ds[-1],raw,all_distance[raw],alignment[selected[0]],alignment[raw]])
+    if trace is not None:
+        trace['selection'] = np.asarray(selection)
     return inside, (np.array(values)-args.p_inf)/(.5*velocity**2), np.array(distances), positive, rejected
 
 
@@ -253,17 +258,23 @@ def extract(args, run):
     br, bp, bn = second
     radius, query = np.r_[-fr[::-1], br[1:] if pole is not None else br], np.vstack((fp[::-1], bp[1:] if pole is not None else bp))
     query_normal = np.vstack((fn[::-1],bn[1:] if pole is not None else bn))
-    pressures, diagnostics = {}, {}
+    pressures, diagnostics, selections = {}, {}, {}
     for name in ['master', 'slave']:
+        trace = {}
         inside, value, distance, fraction, rejected = sample_patch(step/(name+'.vtp'), query, radius, query_normal,
-                                                                  anchor, axis, azimuth, args, velocity)
+                                                                  anchor, axis, azimuth, args, velocity,trace=trace)
         side = 'in' if inside else 'out'
         if side in pressures:
             raise ValueError('Both patches were classified as the same side of the fabric')
         pressures[side] = value
+        selections[side] = trace['selection']
+        furthest_query = int(np.argmax(distance))
         diagnostics[name] = dict(side=side, normal_positive_area_fraction=fraction,
                                  excluded_opposite_normal_faces=rejected,
-                                 nearest_face_distance_max_D0=float(distance.max()/args.diameter))
+                                 nearest_face_distance_max_D0=float(distance.max()/args.diameter),
+                                 nearest_face_distance_max_R=float(radius[furthest_query]),
+                                 raw_nearest_at_max_m=float(trace['selection'][furthest_query,4]),
+                                 furthest_used_at_max_m=float(trace['selection'][furthest_query,2]))
     centre = grid[-1].mean(0)
     relative = query-centre
     e1 = np.array([np.cos(theta),0.,-np.sin(theta)])
@@ -273,6 +284,19 @@ def extract(args, run):
     compact = np.column_stack([compact_r]+[np.interp(compact_r, radius, table[:,j]) for j in range(1,6)])
     if pole is None:
         compact[np.abs(compact_r)<vent, 1:] = np.nan
+    # Compact pressures interpolate FULL samples. Report the maximum distance
+    # over their bracketing samples, not a fictitious newly selected face at R.
+    sampling_compact = []
+    for rr in compact_r:
+        upper = min(int(np.searchsorted(radius,rr)),len(radius)-1)
+        lower = upper if np.isclose(radius[upper],rr,rtol=0,atol=1e-12) else max(upper-1,0)
+        bracket = slice(lower,upper+1)
+        distance_values = [float(selections[s][bracket,k].max())
+                           for s,k in [('in',1),('out',1),('out',4),('out',2)]]
+        if pole is None and abs(rr)<vent:
+            distance_values = [np.nan]*4
+        sampling_compact.append([rr,radius[lower],radius[upper],*distance_values])
+    sampling = np.column_stack([radius,query,selections['in'],selections['out']])
     metadata = dict(run=str(run), name=args.name, pass_number=int(row['pass']), angle_deg=float(angle),
                     velocity_m_s=velocity, diameter_m=args.diameter, surface=str(step), input_shape=str(shape_path),
                     pressure_field=args.pressure_field, pressure_reference_kinematic=args.p_inf,
@@ -282,8 +306,10 @@ def extract(args, run):
                     sampling='Inverse-distance interpolation within each meridian sector, with local surface-normal compatibility; no ring averaging',
                     geometry='Smoothed CFD input surface; profile relative to mean skirt centre',
                     normal_filter='Requires >=99% consistent area orientation; opposite-oriented residual faces excluded only from pressure sampling. Folded/ambiguous surfaces require another method.',
-                    compact_note='Compact table interpolated from full samples; terminal values rounded only for display')
-    return SimpleNamespace(table=table, compact=compact, metadata=metadata, run=run)
+                    compact_note='Compact table interpolated from full samples; terminal values rounded only for display',
+                    sampling_distance_note='Compact distances are maxima over bracketing full samples. Raw nearest includes all faces without orientation/sector filters. These distances do not measure interpolation error.')
+    return SimpleNamespace(table=table, compact=compact, metadata=metadata, run=run,
+                           sampling=sampling,sampling_compact=np.asarray(sampling_compact))
 
 
 def write_table(path, values):
@@ -291,6 +317,23 @@ def write_table(path, values):
         writer = csv.writer(stream)
         writer.writerow(['R','Cp_in','Cp_out','delta_Cp','x_body_D0','h_body_D0'])
         writer.writerows(values)
+
+
+def write_sampling(prefix, result):
+    """Write trace of actual full samples and conservative compact distances."""
+    suffix = ['nearest_face','nearest_m','furthest_used_m','raw_nearest_face','raw_nearest_m',
+              'nearest_normal_alignment','raw_normal_alignment']
+    headers = ['R','query_x_m','query_y_m','query_z_m']+[side+'_'+s for side in ['in','out'] for s in suffix]
+    compact_headers = ['R','R_left','R_right','nearest_in_max_m','nearest_out_max_m',
+                       'raw_nearest_out_max_m','furthest_used_out_max_m']
+    paths = []
+    for ending,columns,data in [('_sampling_full.csv',headers,result.sampling),
+                                ('_sampling_compact.csv',compact_headers,result.sampling_compact)]:
+        path = Path(str(prefix)+ending)
+        with path.open('w',encoding='utf-8',newline='') as stream:
+            writer = csv.writer(stream);writer.writerow(columns);writer.writerows(data)
+        paths.append(str(path))
+    return paths
 
 
 def reference_data(path, angle):
@@ -378,6 +421,7 @@ def main(argv=None):
     parser.add_argument('--pics',type=Path)
     parser.add_argument('--reference',type=Path,help='Optional preliminary digitization CSV, not raw experimental measurements')
     parser.add_argument('--diagnose-normals',action='store_true',help='Report radial normal signs and their location; do not sample pressure or infer physical sides')
+    parser.add_argument('--sampling-report',action='store_true',help='Print compact per-R distances in metres, including unfiltered nearest and interpolation support')
     args = parser.parse_args(argv)
     if not np.isfinite(args.diameter) or args.diameter<=0 or args.neighbours<1 or not 0<args.sector<90 or args.subdivide<1 or not 0<args.normal_angle<90:
         parser.error('Invalid diameter or sampling parameters')
@@ -402,10 +446,20 @@ def main(argv=None):
         stem = f"{args.name}_a{result.metadata['angle_deg']:g}_pass{result.metadata['pass_number']:02d}"+(f'_{suffix}' if suffix else '')
         write_table(folder/(stem+'_full.csv'),result.table)
         write_table(folder/(stem+'_compact.csv'),result.compact)
+        write_sampling(folder/stem,result)
         (folder/(stem+'_metadata.json')).write_text(json.dumps(result.metadata,ensure_ascii=False,indent=2),encoding='utf-8')
         print(f"\n{run}: pass {result.metadata['pass_number']}, α = {result.metadata['angle_deg']:g}°")
         print('R Cp_in Cp_out delta_Cp x_body/D0 h_body/D0')
         np.savetxt(sys.stdout,result.compact,fmt='%+.3f')
+        if args.sampling_report:
+            print('sample R R_left R_right near_in_m near_out_m raw_out_m support_out_m')
+            for values in result.sampling_compact:
+                print('sample '+' '.join(f'{v:+.5f}' for v in values))
+            for diagnostic in result.metadata['diagnostics'].values():
+                print(f"sample_max {diagnostic['side']} R={diagnostic['nearest_face_distance_max_R']:+.5f} "
+                      f"near_m={diagnostic['nearest_face_distance_max_D0']*args.diameter:.5f} "
+                      f"raw_m={diagnostic['raw_nearest_at_max_m']:.5f} "
+                      f"support_m={diagnostic['furthest_used_at_max_m']:.5f}")
         removed = sum(d['excluded_opposite_normal_faces'] for d in result.metadata['diagnostics'].values())
         if removed:
             print(f'Диагностика: исключено из выборки {removed} граней с противоположной ориентацией; подробности в metadata.json')

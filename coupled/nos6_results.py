@@ -346,10 +346,11 @@ def case(work,args):
         prefix = work/'pics'/f'{args.name}_meridian_pass{int(row["pass"]):02d}'
         pressure_table.write_table(Path(str(prefix)+'_full.csv'),result.table)
         pressure_table.write_table(Path(str(prefix)+'_compact.csv'),result.compact)
+        sampling = pressure_table.write_sampling(prefix,result)
         write_json(Path(str(prefix)+'_metadata.json'),result.metadata)
         pressure_table.plot_results([result],SimpleNamespace(reference=args.reference),work/'pics')
         return [str(Path(str(prefix)+s)) for s in ['_full.csv','_compact.csv','_metadata.json']]+[
-                str(work/'pics/pressure_meridians.png'),str(work/'pics/canopy_profiles.png')]
+                str(work/'pics/pressure_meridians.png'),str(work/'pics/canopy_profiles.png')]+sampling
     report.stage('meridian_pressure_and_profile',meridians)
 
     def surface_stage():

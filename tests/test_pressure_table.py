@@ -124,6 +124,39 @@ class MeridianTests(unittest.TestCase):
         result = target.extract(self.args,self.run)
         np.testing.assert_allclose(result.table[:,3],700/450,atol=1e-12)
         self.assertEqual(result.metadata['diagnostics']['slave']['excluded_opposite_normal_faces'],0)
+        pole = result.sampling[np.argmin(np.abs(result.sampling[:,0]))]
+        self.assertLess(pole[15],pole[12]) # Raw closest facet is not the compatible closest one.
+        self.assertLess(pole[17],np.cos(np.radians(self.args.normal_angle)))
+
+    def test_sampling_trace_and_compact_bracketing_distances(self):
+        result = target.extract(self.args,self.run)
+        full = result.sampling
+        self.assertEqual(full.shape[1],18)
+        self.assertTrue(np.all(full[:,12]+1e-12>=full[:,15]))
+        self.assertTrue(np.all(full[:,13]+1e-12>=full[:,12]))
+        for diagnostic in result.metadata['diagnostics'].values():
+            nearest_col,raw_col=(5,8) if diagnostic['side']=='in' else (12,15)
+            index=int(np.argmax(full[:,nearest_col]))
+            self.assertAlmostEqual(diagnostic['nearest_face_distance_max_R'],full[index,0])
+            self.assertAlmostEqual(diagnostic['raw_nearest_at_max_m'],full[index,raw_col])
+        for row in result.sampling_compact:
+            mask=(full[:,0]>=row[1]) & (full[:,0]<=row[2])
+            self.assertTrue(mask.any())
+            np.testing.assert_allclose(row[3:],[full[mask,5].max(),full[mask,12].max(),
+                                              full[mask,15].max(),full[mask,13].max()])
+        paths=target.write_sampling(self.run/'sample',result)
+        self.assertTrue(all(Path(p).is_file() for p in paths))
+
+    def test_sampling_report_cli_prints_metres_and_preserves_pressure(self):
+        captured=io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            result=target.main([str(self.run),'--V','30','--diameter','3','--subdivide','4',
+                                '--sampling-report','--pics',str(self.run/'sampling_figures')])[0]
+        lines=[s for s in captured.getvalue().splitlines() if s.startswith('sample ')]
+        self.assertEqual(len(lines),12) # Header plus eleven compact locations.
+        np.testing.assert_allclose(result.table[:,3],700/450,atol=1e-12)
+        self.assertIn('near_out_m',lines[0])
+        self.assertEqual(len([s for s in captured.getvalue().splitlines() if s.startswith('sample_max ')]),2)
 
     def test_explicit_pass_selection(self):
         self.args.pass_number = 6
