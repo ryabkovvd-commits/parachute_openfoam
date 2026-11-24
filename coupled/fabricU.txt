@@ -24,6 +24,16 @@ if (pair.size() != me.size())
         worst = max(worst, Foam::sqrt(best));
         if (best > 1e-8) pair[i] = -1;
     }
+    labelList used(them.size(),0);
+    forAll(pair,i)
+    {
+        if (pair[i] < 0)
+            FatalErrorInFunction << "Unpaired fabric face on " << me.name()
+                << "; inspect baffle mesh/decomposition" << exit(FatalError);
+        if (++used[pair[i]] > 1)
+            FatalErrorInFunction << "Non-bijective fabric pairing on " << me.name()
+                << exit(FatalError);
+    }
 }
 static scalarField Un;
 static label stamp = -1;

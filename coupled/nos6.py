@@ -2,7 +2,8 @@
 diameter = (24 / np.pi) ** 0.5
 scale = diameter / 19.51
 start = float(FLAG.get("--start-angle", "0"))
-line("D0, LINES, V, RHO, NU =", f"D0, LINES, V, RHO, NU = {diameter!r}, {diameter!r}, 30.0, 1.225, 1.46e-5")
+line("D0, LINES, V, RHO, NU =", f"D0, LINES, V, RHO, NU = {diameter!r}, {diameter!r}, {float(FLAG.get('--V',30))!r}, 1.225, {float(FLAG.get('--nu',1.46e-5))!r}")
+line("SHIFT_TOL = ", f"SHIFT_TOL = {float(FLAG.get('--shape-tol',.03))!r}")
 line("AZIMUTH = -146.3", "AZIMUTH = 0.0")
 line("MOMENT_TOL = 2000.0", f"MOMENT_TOL = {2000 * scale**3!r}")
 line("return pos[:CANOPY].mean(axis=0), 11.0", f"    return pos[:CANOPY].mean(axis=0), {11 * scale!r}")
@@ -29,7 +30,6 @@ if sys.argv[1] == "nos6_held":
     header_start = src.index("# ---- случай ")
     header_end = src.index("mesh = closed_circular(", header_start)
     sub(src[header_start:header_end], '''# ---- случай ----
-SHIFT_TOL, LOAD_TOL = 0.03, None
 angle_text = f"α = {HOLD:g}°" if HOLD is not None else "свободный наклон"
 say(f"\\n{NAME} | купол 6 м², полюс закрыт | {angle_text} | "
     f"{time.strftime('%d.%m %H:%M:%S')}")

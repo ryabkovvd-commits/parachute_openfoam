@@ -45,6 +45,7 @@ from parafoil.inflation.mesh import panel_area_and_normal
 from parafoil.inflation.pressure import uniform_pressure
 
 import vtp
+from run_guard import atomic_json, begin_run, check_cfd, geometry_quality, mark_status, source_hashes
 
 CASE = Path(r"D:\cfd\run\queue")
 OUT = Path(r"D:\cfd\queue")
@@ -91,6 +92,16 @@ if FIXED_SHAPE and (PASSES!=1 or SEED is None or not SEED.is_file() or PULLED):
 #: моделью, а искать привес расчёту не нужно -- и уходит самое дорогое: в
 #: свободном счёте купол доворачивается по 0.9° за проход.
 HOLD = float(FLAGS["--угол"]) if "--угол" in FLAGS else None
+ATTITUDE = FLAGS.get('--attitude','legacy')
+if ATTITUDE not in {'legacy','inner'} or (ATTITUDE=='inner' and (HOLD is None or FIXED_SHAPE)):
+    raise ValueError('--attitude=inner requires a deformable held-angle case')
+if ATTITUDE=='inner' and ('--holder' in FLAGS or '--держатель' in FLAGS):
+    raise ValueError('Do not combine inner kinematic constraint with holder reaction')
+CX_TOL = float(FLAGS.get('--cx-tol',.003))
+TURBULENCE_LENGTH = float(FLAGS.get('--turbulence-length',1.24))
+TURBULENCE_INTENSITY = float(FLAGS.get('--turbulence-intensity',.01))
+if not np.isfinite([D0,LINES,V,RHO,NU,CX_TOL,TURBULENCE_LENGTH,TURBULENCE_INTENSITY]).all() or min(D0,LINES,V,RHO,NU,CX_TOL,TURBULENCE_LENGTH,TURBULENCE_INTENSITY)<=0:
+    raise ValueError('Physical parameters and tolerances must be finite and positive')
 if HOLD is not None:
     # Наклон кладём в плоскость xz: тогда поперечная сила идёт по +x, а ось
     # момента -- ровно +y, вокруг которой и поворачиваем.
@@ -189,8 +200,8 @@ SHAPE = OUT / f"{NAME}_shape.npy"
 FRAMES = OUT / "кадры"
 STORY = OUT / f"{NAME}.json"
 DONE = OUT / f"{NAME}.done"
-K_IN = 1.5 * (0.01 * V) ** 2
-OMEGA_IN = K_IN**0.5 / (0.09**0.25 * 0.1 * 12.4)
+K_IN = 1.5 * (TURBULENCE_INTENSITY * V) ** 2
+OMEGA_IN = K_IN**0.5 / (0.09**0.25 * TURBULENCE_LENGTH)
 _rad, _a = np.radians(AZIMUTH), np.radians(ALPHA)
 TILT = np.array([np.cos(_rad), np.sin(_rad), 0.0])
 PIVOT = np.array([-np.sin(_rad), np.cos(_rad), 0.0])
@@ -206,16 +217,21 @@ def say(text=""):
 
 
 def tilt_of(pos):
-    axis = pos[: (RINGS + 1) * GORES].mean(axis=0)
-    return float(np.degrees(np.arccos(axis[2] / np.linalg.norm(axis))))
+    axis = pos[:CANOPY].mean(axis=0)-pos[CANOPY]
+    norm=float(np.linalg.norm(axis))
+    if not np.isfinite(norm) or norm<=1e-12:
+        raise ValueError('Undefined canopy axis')
+    if HOLD is not None:
+        return float(np.degrees(np.arctan2(axis@TILT,axis[2])))
+    return float(np.degrees(np.arccos(np.clip(axis[2]/norm,-1,1))))
 
 
 def sane(mesh):
-    anchor = mesh.position[mesh.confluence[0]]
-    _, normal = panel_area_and_normal(mesh.position, mesh.quads, anchor)
-    outward = mesh.position[mesh.quads].mean(axis=1) - anchor
-    outward /= np.maximum(np.linalg.norm(outward, axis=1), 1e-9)[:, None]
-    return float((normal * outward).sum(axis=1).min()) > -0.5
+    try:
+        geometry_quality(mesh)
+        return True
+    except ValueError:
+        return False
 
 
 def aitken_factor(residual, last_residual, last_omega):
@@ -249,14 +265,21 @@ def set_attitude(pos, degrees, confluence):
     anchor = pos[confluence]
     rel = pos - anchor
     axis = rel[:CANOPY].mean(axis=0)
-    axis = axis / np.linalg.norm(axis)
+    norm=np.linalg.norm(axis)
+    if not np.isfinite(norm) or norm<=1e-12:
+        raise ValueError('Undefined attitude axis')
+    axis = axis / norm
     tilt = np.radians(degrees)
     want = np.array([np.sin(tilt), 0.0, np.cos(tilt)])
     cross = np.cross(axis, want)
     sine = float(np.linalg.norm(cross))
+    cosine = float(np.clip(axis @ want,-1,1))
     if sine < 1e-12:
-        return pos.copy()
-    cosine = float(axis @ want)
+        if cosine>0:
+            return pos.copy()
+        perpendicular=np.cross(axis,np.eye(3)[np.argmin(np.abs(axis))])
+        perpendicular/=np.linalg.norm(perpendicular)
+        return anchor+rel@(2*np.outer(perpendicular,perpendicular)-np.eye(3)).T
     skew = np.array([[0.0, -cross[2], cross[1]],
                      [cross[2], 0.0, -cross[0]],
                      [-cross[1], cross[0], 0.0]])
@@ -591,7 +614,6 @@ RUN = f"""
 source /usr/lib/openfoam/openfoam2412/etc/bashrc
 KEEP_ROOT="{KEEP}/{NAME}/pass$PASS"
 cd "{WHERE}" || exit 17
-pkill -f simpleFoam; pkill -f mpirun; sleep 2
 # После прохода на подвижной сетке controlDict правлен -- возвращаем исходный.
 [ -f system/controlDict.base ] && cp system/controlDict.base system/controlDict
 rm -rf 0.* [1-9]* processor* postProcessing constant/polyMesh dynamicCode
@@ -612,20 +634,20 @@ snappyHexMesh -overwrite                > log.snappyHexMesh 2>&1 || exit 12
 splitMeshRegions -largestOnly -overwrite > log.split 2>&1        || exit 15
 decomposePar -force                     > log.decomposePar 2>&1  || exit 13
 mpirun -np {CORES} simpleFoam -parallel > log.simpleFoam 2>&1    || exit 14
-reconstructPar                          > log.reconstruct 2>&1
+reconstructPar                          > log.reconstruct 2>&1 || exit 18
 # Поля складываем НАРУЖУ: расчётная папка чистится в начале следующего прохода,
 # и без этого промежуточные шаги жили бы ровно до него.
 KEEP="$KEEP_ROOT"
 mkdir -p "$KEEP"
 for step in [0-9]*; do
-    [ -d "$step" ] && [ "$step" != "0" ] && cp -r "$step" "$KEEP/"
+    if [ -d "$step" ] && [ "$step" != "0" ]; then cp -r "$step" "$KEEP/" || exit 19; fi
 done
 # Сетку -- обязательно: без неё поля просто столбцы чисел без геометрии.
 # Стоит 65 МБ на проход при 323 МБ полей, то есть пятую часть сверх.
-cp -r constant/polyMesh "$KEEP/"
+cp -r constant/polyMesh "$KEEP/" || exit 19
 # Всю postProcessing целиком, а не по угаданным подпутям: линии тока лежат в
 # sets/streamlines, а не в streamlines, и прежняя копия молча промахивалась.
-cp -r postProcessing "$KEEP/"
+cp -r postProcessing "$KEEP/" || exit 19
 echo KEPT=$(du -sm "$KEEP" 2>/dev/null | cut -f1)
 echo CELLS=$(grep -oP 'cells:\\s*\\K[0-9]+' log.snappyHexMesh | tail -1)
 """
@@ -635,7 +657,6 @@ MORPH_RUN = f"""
 source /usr/lib/openfoam/openfoam2412/etc/bashrc
 KEEP_ROOT="{KEEP}/{NAME}/pass$PASS"
 cd "{WHERE}" || exit 17
-pkill -f simpleFoam; pkill -f mpirun; sleep 2
 LAST=$(ls -d [1-9]* 2>/dev/null | sort -n | tail -1)
 [ -n "$LAST" ] && [ -f constant/polyMesh/points ] || exit 16
 for d in [1-9]*; do [ "$d" != "$LAST" ] && rm -rf "$d"; done
@@ -670,19 +691,20 @@ foamDictionary system/controlDict -entry endTime -set $((LAST + {MORPH or 0})) >
 foamDictionary system/controlDict -entry writeInterval -set {max((MORPH or 4) // 4, 1)} > /dev/null
 decomposePar -force -latestTime         > log.decomposePar 2>&1  || exit 13
 mpirun -np {CORES} simpleFoam -parallel > log.simpleFoam 2>&1    || exit 14
-reconstructPar -latestTime              > log.reconstruct 2>&1
+reconstructPar -latestTime              > log.reconstruct 2>&1 || exit 18
 KEEP="$KEEP_ROOT"
 mkdir -p "$KEEP"
 for step in [0-9]*; do
-    [ -d "$step" ] && [ "$step" != "0" ] && [ "$step" != "$LAST" ] && cp -r "$step" "$KEEP/"
+    if [ -d "$step" ] && [ "$step" != "0" ] && [ "$step" != "$LAST" ]; then cp -r "$step" "$KEEP/" || exit 19; fi
 done
-cp -r constant/polyMesh "$KEEP/"
-cp -r postProcessing "$KEEP/"
+cp -r constant/polyMesh "$KEEP/" || exit 19
+cp -r postProcessing "$KEEP/" || exit 19
 echo KEPT=$(du -sm "$KEEP" 2>/dev/null | cut -f1)
 echo CELLS=$(grep -oP 'cells:\\s*\\K[0-9]+' log.checkMesh.morph | head -1)
 """
 WHY = {11: "blockMesh", 12: "snappyHexMesh", 13: "decomposePar",
-       14: "simpleFoam", 15: "splitMeshRegions", 16: "деформация сетки"}
+       14: "simpleFoam", 15: "splitMeshRegions", 16: "деформация сетки",
+       18: "reconstructPar",19: "архивирование"}
 
 
 def run_cfd(step, script=RUN):
@@ -741,6 +763,12 @@ mesh = flat_circular(D0, LINES, gores=GORES, rings=RINGS,
                      line_stride=STRIDE, shear_ratio=SHEAR)
 
 history = json.loads(STORY.read_text(encoding="utf-8")) if STORY.exists() else []
+_config=dict(D0=D0,lines=LINES,V=V,rho=RHO,nu=NU,gores=GORES,rings=RINGS,stride=STRIDE,
+             shear=SHEAR,hold=HOLD,attitude=ATTITUDE,stroke=STROKE,pulled=PULLED,
+             turbulence_length=TURBULENCE_LENGTH,turbulence_intensity=TURBULENCE_INTENSITY,
+             flags={k:v for k,v in FLAGS.items() if k not in {'--shape-tol','--cx-tol','--load-tol','--невязка-нагрузки','--all-passes'}})
+begin_run(OUT,NAME,_config,history,SHAPE,sources=source_hashes(Path(__file__).parent,FLAGS.get('--patch','')))
+_run_active = True
 if SHAPE.exists():
     mesh.position = np.load(SHAPE)
     say(f"продолжаю с прохода {len(history) + 1}")
@@ -777,6 +805,8 @@ if HOLD is not None and not FIXED_SHAPE:
 
 say(f"старт: наклон {tilt_of(mesh.position):.2f}°, "
     f"Dp/D0 = {mesh.projected_diameter() / D0:.4f}")
+geometry_quality(mesh)
+say(f'Удержание угла: {ATTITUDE}; k={K_IN:g}, omega={OMEGA_IN:g}, Lтурб={TURBULENCE_LENGTH:g} м')
 static_dicts(refine_ball(mesh.position) if HOLD is not None else None)
 
 if "--только-сетка" in FLAGS:
@@ -851,7 +881,8 @@ for step in range(len(history) + 1, PASSES + 1):
     mesh_shape = mesh.position.copy() if not code else None
     if code or folder is None:
         say(f"  {step:>2}  {why_failed(code)}")
-        break
+        raise RuntimeError(f'Incomplete CFD pass {step}; no result accepted (code {code})')
+    cfd_validation=check_cfd(CASE,FIELDS/NAME/f'pass{step:02d}',folder.name,Q,S0,D0)
 
     # Preserve the exact structural input of this completed CFD pass. The
     # relaxed frame written below belongs to the NEXT pass instead.
@@ -884,7 +915,8 @@ for step in range(len(history) + 1, PASSES + 1):
     applied = attitude_reaction(mesh, load) if HOLD is not None and HOLDER else load
     for _ in range(0 if FIXED_SHAPE else CHUNKS):
         result = inflate(mesh, node_force=applied, damping=0.98, tolerance=2e-3,
-                         drift_tolerance=1e-8, max_steps=CHUNK)
+                         drift_tolerance=1e-8, max_steps=CHUNK,
+                         attitude_deg=HOLD if ATTITUDE=='inner' else None)
         if result.converged:
             relaxed = True
             break
@@ -895,8 +927,10 @@ for step in range(len(history) + 1, PASSES + 1):
         # сходится, а до равновесия ей ещё далеко.
         say(f"      !! форма не сошлась за {CHUNKS * CHUNK:,} шагов")
     if not sane(mesh):
-        say(f"  {step:>2}  купол вывернулся, останавливаюсь")
-        break
+        raise ValueError(f'Pass {step}: invalid or collapsed structural geometry')
+
+    inner_reaction = (result.constraint_force.sum(0).tolist()
+                      if not FIXED_SHAPE and result.constraint_force is not None else None)
 
     settled = mesh.position.copy()
     # Привес снимаем ДО невязки, иначе Эйткен подбирал бы множитель по
@@ -936,10 +970,18 @@ for step in range(len(history) + 1, PASSES + 1):
                          "sink" if "--sink" in FLAGS else "wall"),
         "stride": STRIDE, "rings": RINGS, "ropes": GORES // STRIDE,
         "shear": SHEAR,
+        "attitude_mode": ATTITUDE,"shape_tolerance": SHIFT_TOL,
+        "turbulence_length_m": TURBULENCE_LENGTH,"turbulence_intensity": TURBULENCE_INTENSITY,
+        "inner_residual": None if FIXED_SHAPE else float(result.residual),
+        "inner_constraint_resultant_N": inner_reaction,
+        "status_scope": "outer coupling criteria, not full CFD/grid convergence",
+        **cfd_validation,
     }
     # Безразмерные -- в тех же осях и с той же опорной площадью, что у
     # Носарева: c = сила/(q*F_п), m_z = момент/(q*F_п*D_п), момент около коуша.
     row["cx"] = row["drag"] / (Q * S0)
+    row["cx_change"] = abs(row["cx"]-history[-1]["cx"]) if history else None
+    row["cx_tol"] = CX_TOL
     row["cy"] = row["side"] / (Q * S0)
     row["mz"] = row["moment"] / (Q * S0 * D0)
     history.append(row)
@@ -954,8 +996,7 @@ for step in range(len(history) + 1, PASSES + 1):
     # потом нечем показать, как купол двигался -- на этом уже споткнулись.
     FRAMES.mkdir(parents=True, exist_ok=True)
     np.save(FRAMES / f"{NAME}_проход{step:02d}.npy", mesh.position)
-    STORY.write_text(json.dumps(history, ensure_ascii=False, indent=1),
-                     encoding="utf-8")
+    atomic_json(STORY,history)
     if HOLD is None:
         quiet = (abs(row["dtilt"]) < TILT_TOL
                  and abs(row["moment"]) < MOMENT_TOL)
@@ -967,6 +1008,8 @@ for step in range(len(history) + 1, PASSES + 1):
     # Недорелаксированная форма не считается установившейся ни в одном режиме:
     # внутренний счёт оборвали на потолке, и равновесия конструкция не нашла.
     quiet = quiet and relaxed
+    if HOLD is not None:
+        quiet = quiet and row['cx_change'] is not None and row['cx_change']<CX_TOL
     steady = steady + 1 if quiet else 0
     before, previous = now, mesh.position.copy()
     if steady >= 2:
@@ -991,7 +1034,7 @@ if history:
         settled = (abs(row["dtilt"]) < TILT_TOL
                    and abs(row["moment"]) < MOMENT_TOL)
     else:
-        settled = left < SHIFT_TOL
+        settled = steady >= 2
     settled = settled and row.get("relaxed", True)
 
 if history:
@@ -1014,22 +1057,22 @@ if history:
     last["settled"] = settled
     if FIXED_SHAPE:
         last['settled'] = None
-        (OUT / f"{NAME}.fixed").write_text(json.dumps(last,ensure_ascii=False,indent=1),encoding='utf-8')
+        mark_status(OUT,NAME,'fixed',last)
         say('  Фиксированная форма: один CFD-проход завершён; сходимость CFD проверяется отдельно')
     elif settled:
-        DONE.write_text(json.dumps(last, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        mark_status(OUT,NAME,'done',last)
     else:
         # Не сошёлся -- .done не пишем вовсе, иначе очередь и сборка отчёта
         # примут это за результат.  Кладём рядом .НЕСОШЁЛСЯ, чтобы было видно,
         # что случай считался и чем кончился.
-        (OUT / f"{NAME}.НЕСОШЁЛСЯ").write_text(
-            json.dumps(last, ensure_ascii=False, indent=1), encoding="utf-8")
+        mark_status(OUT,NAME,'НЕСОШЁЛСЯ',last)
         # Причин две, и они разные: связка не устоялась ИЛИ форма не дошла до
         # равновесия внутри прохода.  Раньше сообщение всегда винило сдвиг, и
         # на n24_a40v это ввело в заблуждение: сдвиг там был 2.34e-03 ПРИ
         # пороге 3e-03, то есть в норме, а не сошлась именно релаксация.
         why = []
+        if HOLD is not None and (last['cx_change'] is None or last['cx_change']>=CX_TOL):
+            why.append(f"Cx change {last['cx_change']}; tolerance {CX_TOL}")
         if HOLD is not None and left >= SHIFT_TOL:
             why.append(f"сдвиг формы {left:.2e} при пороге {SHIFT_TOL:.0e}")
         if HOLD is None and not (abs(last["dtilt"]) < TILT_TOL

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import numpy as np
 
-from cords import SAMPLES
+from cords import SAMPLES, read_cord_load
 from nos6_geometry import closed_circular
 from parafoil.inflation.materials import Webbing
 from parafoil.inflation.relax import _rod_tensions
@@ -45,19 +45,21 @@ def save_rows(path, header, rows):
         writer.writerows(rows)
 
 
-def plot_confluence_loads(path, steps, rows, angle):
-    by_pass = {row[0]: row[-2:] for row in rows}
+def plot_confluence_loads(path, steps, rows, angle, *, title=None):
+    by_pass = {row[0]: row[4:6] for row in rows}
     node_load, max_tension = np.array([by_pass.get(step, (np.nan, np.nan)) for step in steps]).T
     fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True, constrained_layout=True)
-    for ax, values, title, color in (
+    for ax, values, panel_title, color in (
         (axes[0], node_load, "Равнодействующая на общем узле", "#066f93"),
         (axes[1], max_tension, "Максимальное натяжение одной стропы", "#a25418"),
     ):
         ax.plot(steps, values, "o-", color=color)
-        ax.set(title=title, ylabel="Сила, Н", ylim=(0, None))
+        ax.set(title=panel_title, ylabel="Сила, Н", ylim=(0, None))
         ax.grid(alpha=0.23)
     axes[-1].set(xlabel="Номер прохода", xticks=steps)
-    if angle is not None:
+    if title:
+        fig.suptitle(title)
+    elif angle is not None:
         fig.suptitle(f"Нагрузки при α = {angle:g}°")
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -76,6 +78,7 @@ def confluence_loads(work, name, records, output):
     lines = mesh.line_rods
     frames = work / "out" / "кадры"
     rows = []
+    missing_direct=[]
     for record in records:
         step = record["pass"]
         frame = frames / f"{name}_проход{step:02d}.npy"
@@ -87,21 +90,39 @@ def confluence_loads(work, name, records, output):
             raise ValueError(f"Invalid shape in {frame}")
         tension, direction = _rod_tensions(mesh, position)
         # Each line rod ends at the confluence; pull there is toward the skirt.
-        force = -(tension[lines, None] * direction[lines]).sum(axis=0)
-        rows.append((step, *force, np.linalg.norm(force), tension[lines].max()))
+        elastic = -(tension[lines, None] * direction[lines]).sum(axis=0)
+        direct=np.zeros(3)
+        if record.get('cord_width_m'):
+            if 'cord_anchor_force_N' in record:
+                direct=np.asarray(record['cord_anchor_force_N'],dtype=float)
+            else:
+                root=work/'fields'/name/f'pass{step:02d}'/'postProcessing/surfacePressure'
+                candidates=[p for p in root.glob('*') if p.is_dir() and p.name.replace('.','',1).isdigit()]
+                try:
+                    if not candidates: raise FileNotFoundError(root)
+                    folder=max(candidates,key=lambda p:float(p.name))
+                    direct=read_cord_load(mesh,folder,float(record.get('rho',1.225)))[mesh.confluence].sum(0)
+                except (ValueError,FileNotFoundError):
+                    direct=np.full(3,np.nan);missing_direct.append(int(step))
+        if direct.shape!=(3,):
+            raise ValueError('Invalid direct force on confluence')
+        force=elastic+direct
+        rows.append((step,*force,np.linalg.norm(force),tension[lines].max(),*elastic,*direct,np.linalg.norm(elastic)))
     if not rows:
         raise ValueError(f"No saved pass frames in {frames}")
 
     output.mkdir(parents=True, exist_ok=True)
     table = output / "confluence_loads.csv"
     plot = output / "confluence_loads.png"
-    save_rows(table, ("pass", "Fx_N", "Fy_N", "Fz_N", "node_load_N", "max_cord_N"), rows)
+    save_rows(table, ("pass", "Fx_N", "Fy_N", "Fz_N", "node_load_N", "max_cord_N",
+        "elastic_Fx_N","elastic_Fy_N","elastic_Fz_N","direct_Fx_N","direct_Fy_N","direct_Fz_N","elastic_load_N"), rows)
     plot_confluence_loads(plot, sorted(record["pass"] for record in records), rows, config.get("hold"))
     print("pass  node_load_N  max_cord_N")
-    for step, _, _, _, load, maximum in rows:
-        print(f"{step:4d}  {load:11.1f}  {maximum:10.1f}")
+    for row in rows:
+        print(f"{row[0]:4d}  {row[4]:11.1f}  {row[5]:10.1f}")
     print(table)
     print(plot)
+    return dict(missing_direct_passes=missing_direct)
 
 
 def plot_motion(initial, final, anchor, junctions, output):

@@ -153,8 +153,13 @@ def export_surface(
         # its pressure jump from the surface orientation, and there a silent
         # flip loads the canopy backwards.
         for triangle in ((quad[0], quad[2], quad[1]), (quad[0], quad[3], quad[2])):
+            triangle_normal=np.cross(triangle[1]-triangle[0],triangle[2]-triangle[0])
+            magnitude=np.linalg.norm(triangle_normal)
+            if not np.isfinite(magnitude) or magnitude<=1e-16*mesh.nominal_diameter**2:
+                raise ValueError('Degenerate STL triangle')
+            triangle_normal/=magnitude
             lines.append(
-                f"  facet normal {normal[0]:.6e} {normal[1]:.6e} {normal[2]:.6e}"
+                f"  facet normal {triangle_normal[0]:.6e} {triangle_normal[1]:.6e} {triangle_normal[2]:.6e}"
             )
             lines.append("    outer loop")
             for vertex in triangle:

@@ -73,19 +73,30 @@ def nearest(source, target, block=400):
     return idx
 
 
-def delta_cp(folder, kin=KIN, master="master.vtp", slave="slave.vtp"):
+def delta_cp(folder, kin=KIN, master="master.vtp", slave="slave.vtp", *, strict=True):
     """Перепад по граням: наветренная сторона минус подветренная.
 
     Стороны сопоставляются по центрам граней, а не по номерам.
     """
     centre_m, area_m, unit_m, p_m = faces_of(Path(folder) / master)
-    centre_s, _, _, p_s = faces_of(Path(folder) / slave)
+    centre_s, area_s, unit_s, p_s = faces_of(Path(folder) / slave)
+    if not len(centre_m) or not len(centre_s) or kin<=0 or not np.isfinite(kin):
+        raise ValueError('Empty fabric surface or invalid kinetic pressure')
+    mate=nearest(centre_m,centre_s)
+    if not np.isfinite(np.r_[p_m,p_s]).all():
+        raise ValueError('Non-finite fabric pressure')
+    if strict:
+        back=nearest(centre_s,centre_m)
+        if len(centre_m)!=len(centre_s) or np.any(np.linalg.norm(centre_m-centre_s[mate],axis=1)>1e-4) or np.any(back[mate]!=np.arange(len(centre_m))):
+            raise ValueError('Unpaired fabric faces; reject load transfer and inspect mesh')
+        if np.any(area_m<=0) or not np.allclose(area_m,area_s[mate],rtol=1e-5,atol=1e-12) or np.any(np.einsum('ij,ij->i',unit_m,unit_s[mate])>-.99):
+            raise ValueError('Fabric pair areas/normals disagree')
     return (centre_m, area_m, unit_m,
-            (p_m - p_s[nearest(centre_m, centre_s)]) / kin)
+            (p_m - p_s[mate]) / kin)
 
 
 def nodal_load(mesh, folder, q=Q, kin=KIN,
-               master="master.vtp", slave="slave.vtp"):
+               master="master.vtp", slave="slave.vtp", *, strict=True):
     """Узловые силы стержневой модели по перепаду на гранях потока.
 
     Сила грани dCp*S*q*n уходит на четыре угла ближайшей панели с весами,
@@ -94,7 +105,7 @@ def nodal_load(mesh, folder, q=Q, kin=KIN,
 
     Возвращает (узловые силы, равнодействующая по граням, dCp по граням).
     """
-    centre_m, area_m, unit_m, dcp = delta_cp(folder, kin, master, slave)
+    centre_m, area_m, unit_m, dcp = delta_cp(folder, kin, master, slave,strict=strict)
     face_force = (dcp * area_m * q)[:, None] * unit_m
     centroids = mesh.position[mesh.quads].mean(axis=1)
     near = nearest(centre_m, centroids)

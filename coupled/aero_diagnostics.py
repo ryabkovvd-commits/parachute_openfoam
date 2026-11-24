@@ -96,7 +96,7 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
         anchor = mesh.position[mesh.confluence[0]]
         forces = (delta*a*q)[:,None]*n
         moments = np.cross(c-anchor,forces)
-        load,_,_ = vtp.nodal_load(mesh,folder,q=q,kin=kin)
+        load,_,_ = vtp.nodal_load(mesh,folder,q=q,kin=kin,strict=False)
     finally:
         vtp.arrays = arrays
     f_face, f_node = forces.sum(0),load.sum(0)

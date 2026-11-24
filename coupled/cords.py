@@ -75,8 +75,6 @@ if __name__ == "__main__":
     cx_tol = float(FLAG.get("--cx-tol", 0.003))
     if not all(np.isfinite(value) and value > 0 for value in (width, cd, cx_tol)):
         raise ValueError("Cord width, Cd and Cx tolerance must be positive")
-    line("SHIFT_TOL = ", "SHIFT_TOL = 0.003")
-    sub("        settled = left < SHIFT_TOL\n", "        settled = steady >= 2\n")
     sub("import vtp\n", "import vtp\nfrom cords import write_cords, read_cord_load, copyfile\n")
     sub("for step in range(len(history) + 1, PASSES + 1):\n",
         "for step in range(len(history) + 1, PASSES + 1):\n"
@@ -90,20 +88,14 @@ if __name__ == "__main__":
         "    say(f'cords: dCx={cord_load.sum(axis=0) @ ONSET / (Q * S0):.6f}, dMz={cord_mz:.6f}')\n")
     sub('    row["cx"] = row["drag"] / (Q * S0)\n',
         '    row["cx"] = row["drag"] / (Q * S0)\n'
-        '    row["cx_change"] = abs(row["cx"] - history[-1]["cx"]) if history else None\n'
-        f'    row["cx_tol"] = {cx_tol!r}\n'
         '    row["cord_cx"] = float(cord_load.sum(axis=0) @ ONSET / (Q * S0))\n'
         '    row["cord_cy"] = float(cord_load.sum(axis=0) @ SIDE / (Q * S0))\n'
         '    row["cord_mz"] = cord_mz\n'
         f'    row["cord_width_m"] = {width!r}\n'
         f'    row["cord_cd"] = {cd!r}\n')
-    sub("    steady = steady + 1 if quiet else 0\n",
-        '    quiet = quiet and row["cx_change"] is not None and row["cx_change"] < row["cx_tol"]\n'
-        "    steady = steady + 1 if quiet else 0\n")
-    sub('        if not last.get("relaxed", True):\n',
-        '        if last["cx_change"] is None or last["cx_change"] >= last["cx_tol"]:\n'
-        '            why.append(f"Cx change: {last[\'cx_change\']}; tolerance {last[\'cx_tol\']}")\n'
-        '        if not last.get("relaxed", True):\n')
+    sub('    row["cx"] = row["drag"] / (Q * S0)\n',
+        '    row["cx"] = row["drag"] / (Q * S0)\n'
+        '    row["cord_anchor_force_N"] = cord_load[mesh.confluence].sum(axis=0).tolist()\n')
     sub("    np.save(SHAPE, mesh.position)\n",
         '    copyfile(CASE / "constant/triSurface/canopy.stl", FIELDS / NAME / f"pass{step:02d}/canopy.stl")\n'
         "    np.save(SHAPE, mesh.position)\n")

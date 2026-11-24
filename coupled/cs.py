@@ -7,6 +7,9 @@
                   закон dp/rho = D*Un + CW*|Un|*Un; D = 5000, CW = 0 -- глухая
     --mesh=R      все ячейки мельче в R раз по каждому направлению
     --shape-tol=E порог внешней невязки формы в долях D0 при заданном угле
+    --cx-tol=E    допуск абсолютного изменения Cx (по умолчанию 0.003)
+    --attitude=legacy|inner  поворот после релаксации либо ограничение внутри неё
+    --turbulence-length=L  масштаб турбулентности на входе, м (1.24)
     --all-passes  выполнить все заданные проходы без ранней остановки по допуску
     --load=rings  осреднить перепад по поясам только для механики оболочки
     --fabric-tan=K доля касательной скорости со стороны отсоса на стороне выдува
@@ -19,7 +22,7 @@
                   Проверено дома 28.09: глухой предел -0.12 % к стенке.
                   ИСПОЛЬЗОВАТЬ ЕГО, а не --sink: сток на куполе теряет ~50 % силы.
 
-coupled.py не меняется: правки вносятся заменой текста при запуске, и каждая
+Дополнительные режимы формируются заменой текста coupled.py при запуске, и каждая
 обязана найтись ровно один раз -- иначе остановка, а не молчаливый счёт по
 старой постановке.  Этот файл заменяет cc.py.
 """
@@ -48,6 +51,15 @@ if ("--подвижная" in " ".join(sys.argv) or "--morph" in " ".join(sys.ar
     sys.exit("cs.py: --подвижная пока не сочетается с --urans и --patch=mks3")
 
 src = (HERE / "coupled.py").read_text(encoding="utf-8")
+_flag_sources=src+'\n'+Path(__file__).read_text(encoding='utf-8')
+for _patch in filter(None,FLAG.get('--patch','').split(',')):
+    if not _patch.isidentifier() or not (HERE/f'{_patch}.py').is_file():
+        sys.exit(f'cs.py: missing patch module: {_patch}')
+    _flag_sources+='\n'+(HERE/f'{_patch}.py').read_text(encoding='utf-8')
+_known=set(re.findall(r"""["'](--[\w-]+)["']""",_flag_sources))
+_unknown={a.split('=',1)[0] for a in sys.argv[1:] if a.startswith('--')}-_known
+if _unknown:
+    sys.exit('cs.py: unknown option(s): '+', '.join(sorted(_unknown)))
 
 
 def sub(old, new, count=1):
@@ -98,7 +110,8 @@ if "--mesh-from" in FLAG:
         "echo CELLS=$(grep -oP 'cells:\\\\s*\\\\K[0-9]+' log.checkMesh.fixed | head -1)\n\"\"\"\n#: Проход на подвижной сетке")
 # Три сценария: проход с перестройкой, только сетка, проход на подвижной сетке.
 sub("source /usr/lib/openfoam/openfoam2412/etc/bashrc\n", "", count=3)
-sub("pkill -f simpleFoam; pkill -f mpirun; sleep 2\n", "", count=2)
+if "pkill -f simpleFoam; pkill -f mpirun; sleep 2\n" in src:
+    sub("pkill -f simpleFoam; pkill -f mpirun; sleep 2\n", "", count=2)
 line("coupled_run.sh\")", '    path = Path("coupled_run.sh").resolve()')
 rows = src.split("\n")
 i = [k for k, r in enumerate(rows) if "export PASS={step:02d}" in r]
@@ -133,8 +146,6 @@ if "--shape-tol" in FLAG:
         sys.exit("cs.py: --shape-tol должен быть положительным числом")
     if not np.isfinite(shape_tol) or shape_tol <= 0:
         sys.exit("cs.py: --shape-tol должен быть конечным и положительным")
-    line("SHIFT_TOL = ", f"SHIFT_TOL = {shape_tol!r}")
-    sub("        settled = left < SHIFT_TOL\n", "        settled = steady >= 2\n")
     MODE.append(f"Порог невязки формы: {shape_tol:g} от D0")
 
 if "--all-passes" in sys.argv:
@@ -337,7 +348,7 @@ def extra_dicts(write, head, cores):
           "constraints { fabric { type preserveFaceZones; zones (canopyFaces); } }\n")
 
 
-def sink_dcp(folder, kin=vtp.KIN, master=None, slave=None):
+def sink_dcp(folder, kin=vtp.KIN, master=None, slave=None, *, strict=True):
     """Перепад по граням ткани -- ровно тот, что снял сток: грань, площадь,
     нормаль и dp/rho = (D + CW*|Un|)*Un.  Сила грани dcp*S*q*n."""
     parts = [np.loadtxt(f, ndmin=2) for f in sorted(Path(folder).glob("fabric*.dat"))
@@ -427,13 +438,28 @@ sub('say(f"диагонали: ', 'for _m in MODE:\n    say(_m)\nsay(f"диаг�
 
 # --patch=имя[,имя] -- дополнительные правки из coupled/имя.py (например, mks3)
 for _name in filter(None, FLAG.get("--patch", "").split(",")):
+    if not _name.isidentifier() or not (HERE / f"{_name}.py").is_file():
+        sys.exit(f'cs.py: required patch module is missing: {_name}')
     exec(compile((HERE / f"{_name}.py").read_text(encoding="utf-8"), _name + ".py", "exec"))
+
+if '--shape-tol' in FLAG:
+    line('SHIFT_TOL = ', f'SHIFT_TOL = {shape_tol!r}')
+if (FLAG.get('--load')=='rings' and not (HERE/'ringload.py').is_file()) or (
+    ('--exact-load' in sys.argv or FLAG.get('--перенос')=='точный' or any(a.startswith(('--morph','--подвижная')) for a in sys.argv))
+    and not (HERE/'meshmorph.py').is_file()):
+    sys.exit('cs.py: requested optional mode needs ringload.py/meshmorph.py, absent from this package')
 
 sys.argv[0] = str(HERE / "coupled.py")
 g = {"__name__": "__main__", "__file__": sys.argv[0], "MODE": MODE,
      "EXTRA": extra_fabric if FABRIC else extra_dicts,
      "FABRIC_U": fabric_u() if FABRIC else ""}
-exec(compile(src, sys.argv[0], "exec"), g)
+try:
+    exec(compile(src, sys.argv[0], "exec"), g)
+except Exception as error:
+    if g.get('_run_active'):
+        from run_guard import record_failure
+        record_failure(g['OUT'],g['NAME'],error)
+    raise
 
 # ---- нестационарный: разброс сил по времени ----------------------------------
 if URANS:

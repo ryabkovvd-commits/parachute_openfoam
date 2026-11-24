@@ -37,9 +37,9 @@ class ConfigurationTests(unittest.TestCase):
         compile(source,'generated-cluster-case','exec')
         minimum=1 if '--fixed-shape' in extra else 6
         for text in ['input_shape.npy',f'if steady >= 2 and step >= {minimum}:',
-                     'SHIFT_TOL, LOAD_TOL = 0.03, None','cord_load = read_cord_load',
+                     'SHIFT_TOL = ','cord_load = read_cord_load',
                      '"canopy_model"','"D0": D0']:
-            self.assertIn(text,source)
+            self.assertTrue(text in source,f'Missing generated configuration element: {text}')
         self.assertEqual(bool(captured['boundary']),fabric)
         return source
 

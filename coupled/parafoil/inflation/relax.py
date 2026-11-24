@@ -54,6 +54,7 @@ import numpy as np
 
 from .mesh import CanopyMesh, panel_area_and_normal
 from .pressure import PressureField, uniform_pressure
+from .constraints import MeanAxisConstraint
 
 
 #: How often the canopy's attitude is checked, in steps.  The drift being
@@ -100,6 +101,8 @@ class InflationResult:
     confluence_load: np.ndarray
     pressure_resultant: np.ndarray  # (3,) integral of the pressure, N
     history: np.ndarray            # (k, 2) step and mean node movement
+    other_applied_resultant: np.ndarray | None = None
+    constraint_force: np.ndarray | None = None
 
     @property
     def projected_ratio(self) -> float:
@@ -124,11 +127,14 @@ class InflationResult:
         Nothing in the solver enforces this, so it is a genuine independent
         test that the shape has converged rather than merely stopped moving.
         """
-        scale = np.linalg.norm(self.pressure_resultant)
+        expected=self.pressure_resultant.copy()
+        if self.other_applied_resultant is not None:
+            expected+=self.other_applied_resultant
+        scale = np.linalg.norm(expected)
         if scale < 1e-9:
             return 0.0
         return float(
-            np.linalg.norm(self.pressure_resultant - self.confluence_load) / scale
+            np.linalg.norm(expected - self.confluence_load) / scale
         )
 
     def safety_factors(self) -> np.ndarray:
@@ -359,6 +365,7 @@ def inflate(
     tolerance: float = 1e-6,
     drift_tolerance: float = 1e-9,
     record_every: int = 200,
+    attitude_deg: float | None = None,
 ) -> InflationResult:
     """Relax the canopy to its shape under ``pressure``.
 
@@ -414,7 +421,7 @@ def inflate(
         and :attr:`~InflationResult.balance_error` before believing anything
         else in it.
     """
-    if not 0.0 < damping <= 1.0:
+    if not 0.0 < damping <= 1.0 or max_steps<1 or tolerance<=0 or drift_tolerance<0 or record_every<1:
         raise ValueError("damping must lie in (0, 1]")
     if (pressure is None) == (node_force is None):
         raise ValueError("give either pressure or node_force, not both")
@@ -424,12 +431,21 @@ def inflate(
             raise ValueError(
                 f"node_force must be {mesh.position.shape}, got {node_force.shape}"
             )
+        if not np.isfinite(node_force).all():
+            raise ValueError('Non-finite structural loads')
 
     position = mesh.position.copy()
     velocity = np.zeros_like(position)
     movable = np.isfinite(mesh.mass)
     inv_mass = np.zeros(len(position))
     inv_mass[movable] = 1.0 / mesh.mass[movable]
+    if not np.isfinite(position).all() or np.any(mesh.mass[movable]<=0):
+        raise ValueError('Invalid coordinates or movable masses')
+    constraint=MeanAxisConstraint(mesh,attitude_deg) if attitude_deg is not None else None
+    if constraint is not None:
+        position=constraint.align_initial(position)
+        constraint.project_state(position,velocity)
+    constraint_force=np.zeros_like(position)
 
     dt = _courant_step(mesh)
     # The confluence point sits inside the canopy, so it is what panel normals
@@ -473,6 +489,8 @@ def inflate(
         force = pressure_force + weight
         np.add.at(force, mesh.rods[:, 0], pull)
         np.add.at(force, mesh.rods[:, 1], -pull)
+        if constraint is not None:
+            force,constraint_force=constraint.project_force(force)
 
         # --- convergence on the out-of-balance force ------------------------
         # Not on how far the nodes moved this step: that scales with the time
@@ -481,7 +499,8 @@ def inflate(
         # and that test is independent of how the solver got there.
         out_of_balance = np.linalg.norm(force[movable], axis=1)
         scale = np.linalg.norm(pressure_force[movable], axis=1).mean()
-        residual = float(out_of_balance.mean() / scale) if scale > 1e-12 else 0.0
+        # Below 1 N/node use an explicit 1-N reference, never a fabricated zero.
+        residual = float(out_of_balance.mean() / max(scale,1.0))
 
         # --- and on the canopy having stopped turning ------------------------
         # The force residual alone is not enough, and the way it fails is
@@ -510,6 +529,10 @@ def inflate(
         velocity = (velocity + acceleration * dt) * damping
         velocity[~movable] = 0.0
         position += velocity * dt
+        if constraint is not None:
+            constraint.project_state(position,velocity)
+        if not np.isfinite(position).all():
+            raise FloatingPointError('Structural coordinates diverged')
 
         if step % record_every == 0 or step == 1:
             history.append((step, residual))
@@ -540,12 +563,24 @@ def inflate(
         centroids = position[mesh.quads].mean(axis=1)
         dp = pressure.at(centroids, normal, mesh.nominal_diameter / 2.0)
         pressure_resultant = ((dp * area)[:, None] * normal).sum(axis=0)
+        pressure_force=np.zeros_like(position)
+        for corner in range(4):
+            np.add.at(pressure_force,mesh.quads[:,corner],((dp*area)[:,None]*normal)/4)
     else:
         pressure_resultant = node_force.sum(axis=0)
 
     lines = mesh.line_rods
-    _, direction = _rod_tensions(mesh, position)
+    tension, direction = _rod_tensions(mesh, position)
+    final_force=pressure_force+weight
+    np.add.at(final_force,mesh.rods[:,0],tension[:,None]*direction)
+    np.add.at(final_force,mesh.rods[:,1],-tension[:,None]*direction)
+    if constraint is not None:
+        final_force,constraint_force=constraint.project_force(final_force)
+    scale=max(float(np.linalg.norm(pressure_force[movable],axis=1).mean()),1.0)
+    residual=float(np.linalg.norm(final_force[movable],axis=1).mean()/scale)
+    converged=converged and residual<tolerance
     confluence_load = -(tension[lines][:, None] * direction[lines]).sum(axis=0)
+    confluence_load += pressure_force[mesh.confluence].sum(0)+weight[mesh.confluence].sum(0)
 
     return InflationResult(
         mesh=mesh,
@@ -556,4 +591,6 @@ def inflate(
         confluence_load=confluence_load,
         pressure_resultant=pressure_resultant,
         history=np.asarray(history, dtype=np.float64),
+        other_applied_resultant=weight.sum(0)+constraint_force.sum(0),
+        constraint_force=constraint_force,
     )

@@ -36,14 +36,21 @@ def read_records(work,name=NAME):
 
 
 def saved_status(work,step,name=NAME):
+    try:
+        failed=json.loads((work/'out'/f'{name}.failed').read_text(encoding='utf-8'))
+        if int(failed['last_completed_pass'])==int(step):
+            return 'not_converged'
+    except (OSError,ValueError,KeyError,TypeError):
+        pass
+    matches=[]
     for suffix,status in [('НЕСОШЁЛСЯ','not_converged'),('done','converged')]:
         try:
             record = json.loads((work/'out'/f'{name}.{suffix}').read_text(encoding='utf-8'))
             if int(record.get('pass',-1))==int(step):
-                return status
+                matches.append(status)
         except (OSError,ValueError,TypeError):
             pass
-    return 'unconfirmed'
+    return matches[0] if len(matches)==1 else 'unconfirmed'
 
 
 def clean_json(value):
@@ -117,6 +124,7 @@ def history_outputs(work,records,name):
         if len(rows)>1 and rows[-2].get(key) is not None:
             summary[key+'_last_change_abs'] = abs(float(last[key])-float(rows[-2][key]))
     summary['iteration_note'] = 'Quasi-static passes are not physical time. Last-three-pass ranges measure iteration drift, not pulsations.'
+    summary['status_scope']='Outer coupling criteria only; CFD, moment and grid convergence are separate checks.'
     final = csv_records(work/'out/adh_summary.csv',[summary],columns)
     summary_json = write_json(work/'out/adh_summary.json',summary)
     n = [r['pass'] for r in rows]
@@ -126,7 +134,7 @@ def history_outputs(work,records,name):
         ax.set_ylabel(label)
     axes[1,0].plot(n,[r.get('gap',np.nan) for r in rows],'o-',ms=3,label='Невязка формы gap')
     axes[1,0].plot(n,[r.get('shift',np.nan) for r in rows],':',label='Принятый сдвиг shift')
-    axes[1,0].axhline(.03,color='gray',ls='--',label='Текущий допуск 0,03')
+    axes[1,0].axhline(last.get('shape_tolerance',.03),color='gray',ls='--',label='Допуск формы')
     axes[1,0].set_ylabel('Доля D₀')
     axes[1,0].legend(fontsize=7)
     if all(r.get('gap') is None for r in rows):
@@ -143,7 +151,7 @@ def history_outputs(work,records,name):
         ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     for ax in axes[-1]:
         ax.set_xlabel('Номер внешнего прохода')
-    status_label = {'converged':'сошёлся','not_converged':'не сошёлся','unconfirmed':'статус не подтверждён'}[last['status']]
+    status_label = {'converged':'внешние критерии выполнены','not_converged':'внешние критерии не выполнены','unconfirmed':'статус не подтверждён'}[last['status']]
     fig.suptitle(f"Сходимость параметров · α = {last.get('hold',0):g}° · {status_label}")
     fig.tight_layout()
     image = work/'pics/convergence_criteria.png'
@@ -217,6 +225,11 @@ def summary_lock(output):
 
 
 def polar(output,roots,name=NAME):
+    with summary_lock(output):
+        return _polar_locked(output,roots,name)
+
+
+def _polar_locked(output,roots,name=NAME):
     records,errors = [],[]
     for work in discover(roots,name):
         try:
@@ -233,33 +246,32 @@ def polar(output,roots,name=NAME):
     if not records:
         raise ValueError('No valid held-angle results found')
     records.sort(key=lambda r:(r['series'],r['angle'],r['case']))
-    with summary_lock(output):
-        table = csv_records(output/'polar.csv',records,
-                            ['angle','series','case','canopy_model','pass','status','cx','cy','mz','K','gap','cx_change'])
-        groups = {}
-        for row in records:
-            groups.setdefault(row['series'],[]).append(row)
-        fig,axes = plt.subplots(2,2,figsize=(11,8),sharex=True)
-        for ax,key,label in zip(axes.flat,['cx','cy','mz','K'],['Cx','Cy','mz','K = Cy/Cx']):
-            for series,rows in groups.items():
-                angles,values = [r['angle'] for r in rows],[r.get(key,np.nan) for r in rows]
-                line, = ax.plot(angles,values,'-' if len(set(angles))==len(angles) else 'None',
-                                label=Path(series).parent.name+'/'+Path(series).name,alpha=.6)
-                for r,value in zip(rows,values):
-                    style = {'converged':'o','not_converged':'x','unconfirmed':'^'}[r['status']]
-                    ax.plot(r['angle'],value,style,color=line.get_color())
-            ax.axhline(0,color='.65',lw=.7)
-            ax.grid(alpha=.23)
-            ax.set_ylabel(label)
-        axes[0,0].legend(fontsize=8)
-        for ax in axes[-1]:
-            ax.set_xlabel('Угол атаки, град')
-        fig.suptitle('АДХ · ○ сходимость подтверждена · × не сошёлся · △ статус неизвестен')
-        fig.tight_layout()
-        fig.savefig(output/'polar.png',dpi=150)
-        plt.close(fig)
-        status = write_json(output/'polar_status.json',dict(cases=len(records),unreadable=errors,
-                            note='Array jobs remain separate series. Only solver status markers confirm convergence.'))
+    table = csv_records(output/'polar.csv',records,
+                        ['angle','series','case','canopy_model','pass','status','cx','cy','mz','K','gap','cx_change'])
+    groups = {}
+    for row in records:
+        groups.setdefault(row['series'],[]).append(row)
+    fig,axes = plt.subplots(2,2,figsize=(11,8),sharex=True)
+    for ax,key,label in zip(axes.flat,['cx','cy','mz','K'],['Cx','Cy','mz','K = Cy/Cx']):
+        for series,rows in groups.items():
+            angles,values = [r['angle'] for r in rows],[r.get(key,np.nan) for r in rows]
+            line, = ax.plot(angles,values,'-' if len(set(angles))==len(angles) else 'None',
+                            label=Path(series).parent.name+'/'+Path(series).name,alpha=.6)
+            for r,value in zip(rows,values):
+                style = {'converged':'o','not_converged':'x','unconfirmed':'^'}[r['status']]
+                ax.plot(r['angle'],value,style,color=line.get_color())
+        ax.axhline(0,color='.65',lw=.7)
+        ax.grid(alpha=.23)
+        ax.set_ylabel(label)
+    axes[0,0].legend(fontsize=8)
+    for ax in axes[-1]:
+        ax.set_xlabel('Угол атаки, град')
+    fig.suptitle('АДХ · ○ внешние критерии выполнены · × не выполнены · △ статус неизвестен')
+    fig.tight_layout()
+    fig.savefig(output/'polar.png',dpi=150)
+    plt.close(fig)
+    status = write_json(output/'polar_status.json',dict(cases=len(records),unreadable=errors,
+                        note='Array jobs remain separate series. Only solver status markers confirm convergence.'))
     return [table,str(output/'polar.png'),status]
 
 
@@ -366,12 +378,13 @@ def case(work,args):
             raise FileNotFoundError('Fixed-shape probe: inherited structural tensions are not a response to the new flow')
         if args.pole!='closed' or not np.isclose(diameter,np.sqrt(24/np.pi)):
             raise FileNotFoundError('Confluence helper requires the closed 6 m2 model')
-        confluence_loads(work,args.name,records,work/'out')
+        load_info=confluence_loads(work,args.name,records,work/'out')
         artifacts = [str(work/'out/confluence_loads.csv'),str(work/'out/confluence_loads.png')]
         missing = [int(r['pass']) for r in records
                    if not (work/'out/кадры'/f"{args.name}_проход{int(r['pass']):02d}.npy").is_file()]
-        return dict(status='partial' if missing else 'ok',artifacts=artifacts,
-                    reason=f'Missing structural frames: {missing}' if missing else '')
+        missing_direct=load_info.get('missing_direct_passes',[])
+        return dict(status='partial' if missing or missing_direct else 'ok',artifacts=artifacts,
+                    reason=f'Missing frames: {missing}; direct confluence forces unavailable: {missing_direct}' if missing or missing_direct else '')
     report.stage('confluence_loads',cord_loads)
     if args.gif!='off':
         report.stage('flow_gif',lambda:run_plots(True))

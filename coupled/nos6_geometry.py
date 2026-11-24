@@ -58,8 +58,6 @@ def export_closed_surface(mesh, path, *, subdivide=12):
     facets = []
     for first, second in zip(crown, np.roll(crown, -1, axis=0)):
         normal = np.cross(first - pole, second - pole)
-        if normal @ (pole - reference) < 0:
-            first, second, normal = second, first, -normal
         length = np.linalg.norm(normal)
         if not np.isfinite(length) or length == 0:
             raise ValueError("Degenerate STL triangle at the pole")
