@@ -48,6 +48,14 @@ class PostprocessingTests(unittest.TestCase):
         tree = ET.parse(next(self.run.glob('pics/*deltaCp.vtp')))
         flags = tree.find(".//DataArray[@Name='paired']").text.split()
         self.assertTrue(all(flag=='1' for flag in flags))
+        bands=np.genfromtxt(self.run/'out/moment_bands_pass12.csv',delimiter=',',names=True,encoding='utf-8-sig')
+        np.testing.assert_allclose(bands['Cp_master']-bands['Cp_slave'],bands['delta_Cp'],atol=1e-12)
+        np.testing.assert_allclose(bands['dmz_zFx']+bands['dmz_minus_xFz'],bands['dmz'],atol=1e-12)
+        with (self.run/'out/moment_halves_pass12.csv').open(encoding='utf-8-sig') as stream:
+            halves=list(csv.DictReader(stream))
+        self.assertEqual(len(halves),2)
+        self.assertAlmostEqual(sum(float(r['dmz']) for r in halves),sum(bands['dmz']),places=12)
+        self.assertAlmostEqual(report['moment_terms_paired_mz']['zFx'],sum(bands['dmz_zFx']),places=12)
 
     def write_linear_cut(self):
         coords = np.array([[x,.001,z] for z in np.linspace(0,2,5) for x in np.linspace(-1,1,5)])

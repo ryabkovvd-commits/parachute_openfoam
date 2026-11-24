@@ -102,12 +102,18 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
     f_face, f_node = forces.sum(0),load.sum(0)
     m_face,m_node = moments.sum(0),np.cross(mesh.position-anchor,load).sum(0)
     scale = q*area0*diameter
+    relative = c-anchor
+    term_zfx = relative[:,2]*forces[:,0]/scale
+    term_minus_xfz = -relative[:,0]*forces[:,2]/scale
     coverage = float(a[paired].sum()/a.sum())
     report = dict(pass_number=int(row['pass']),time=float(folder.name),pressure_field=field,
                   input_shape=str(shape),pair_tolerance_m=tolerance,
                   paired_area_fraction=coverage,unpaired_master_faces=int((~paired).sum()),
                   unpaired_slave_faces=int((~paired_slave).sum()),
                   pair_distance_max_m=float(distance.max()),
+                  moment_terms_paired_mz=dict(zFx=float(term_zfx[paired].sum()),
+                                             minus_xFz=float(term_minus_xfz[paired].sum())),
+                  bank_pressure_note='Cp_master=p_master/(V^2/2), Cp_slave=p_slave/(V^2/2), using the solver zero-pressure reference. Patch names do not independently identify inside/outside at folds.',
                   face_force_N=f_face.tolist(),node_force_N=f_node.tolist(),
                   face_moment_Nm=m_face.tolist(),node_moment_Nm=m_node.tolist(),
                   paired_force_N=forces[paired].sum(0).tolist(),paired_moment_Nm=moments[paired].sum(0).tolist(),
@@ -164,15 +170,28 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
         bands.append([left,right,int(mask.sum()),float(a[mask].sum()),
                       float(np.average(delta[mask],weights=a[mask])) if mask.any() else np.nan,
                       float(forces[mask,2].sum()/(q*area0)),float(forces[mask,0].sum()/(q*area0)),
-                      float(moments[mask,1].sum()/scale)])
+                      float(moments[mask,1].sum()/scale),
+                      float(np.average(pm[mask]/kin,weights=a[mask])) if mask.any() else np.nan,
+                      float(np.average(ps[forward[mask]]/kin,weights=a[mask])) if mask.any() else np.nan,
+                      float(term_zfx[mask].sum()),float(term_minus_xfz[mask].sum())])
     bands = np.array(bands)
     band_csv = save_csv(out/f'moment_bands_pass{number:02d}.csv',
-                       ['x_body_Rrim_min','x_body_Rrim_max','faces','area_m2','delta_Cp','dCx','dCy','dmz'],bands)
+                       ['x_body_Rrim_min','x_body_Rrim_max','faces','area_m2','delta_Cp','dCx','dCy','dmz',
+                        'Cp_master','Cp_slave','dmz_zFx','dmz_minus_xFz'],bands)
+    halves=[]
+    for label,selection in [('x_body_negative',xi<0),('x_body_nonnegative',xi>=0)]:
+        mask=paired & selection
+        mean=lambda values:float(np.average(values[mask],weights=a[mask])) if mask.any() else np.nan
+        halves.append([label,float(a[mask].sum()),mean(pm/kin),mean(ps[forward]/kin),
+                       mean(delta),float(term_zfx[mask].sum()),float(term_minus_xfz[mask].sum()),
+                       float(moments[mask,1].sum()/scale)])
+    half_csv=save_csv(out/f'moment_halves_pass{number:02d}.csv',
+                     ['half','area_m2','Cp_master','Cp_slave','delta_Cp','dmz_zFx','dmz_minus_xFz','dmz'],halves)
     fig,axes = plt.subplots(1,2,figsize=(11,4))
     mid = bands[:,:2].mean(1)
-    axes[0].bar(mid,bands[:,-1],width=np.diff(bounds)*.85,color=np.where(bands[:,-1]>=0,'#2166ac','#b2182b'))
+    axes[0].bar(mid,bands[:,7],width=np.diff(bounds)*.85,color=np.where(bands[:,7]>=0,'#2166ac','#b2182b'))
     axes[0].set(title='Вклад участков купола в момент',ylabel='Δmz относительно коуша, ось +Y')
-    axes[1].plot(mid,np.cumsum(bands[:,-1]),'o-',color='#333333',ms=4)
+    axes[1].plot(mid,np.cumsum(bands[:,7]),'o-',color='#333333',ms=4)
     axes[1].set(title='Накопленный момент давления',ylabel='Сумма Δmz')
     for ax in axes:
         ax.axhline(0,color='.5',lw=.7); ax.grid(alpha=.2)
@@ -181,7 +200,24 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
     fig.tight_layout()
     plot = pics/'moment_contributions.png'
     fig.savefig(plot,dpi=150); plt.close(fig)
-    return [str(meta),table,str(vtp_path),band_csv,str(plot)],report
+    fig,axes=plt.subplots(1,2,figsize=(12,4.6),constrained_layout=True)
+    for column,label,style,color in [(8,'master','o-','#066f93'),(9,'slave','s--','#a25418')]:
+        axes[0].plot(mid,bands[:,column],style,color=color,label=label)
+    axes[0].set(title='Давление на двух берегах ткани',ylabel='Cp относительно нуля давления в решателе')
+    width=np.diff(bounds)*.25
+    axes[1].bar(mid-width/2,bands[:,10],width=width,color='#066f93',label=r'$r_z\,dF_x/(qS_0D_0)$')
+    axes[1].bar(mid+width/2,bands[:,11],width=width,color='#a25418',hatch='//',label=r'$-r_x\,dF_z/(qS_0D_0)$')
+    axes[1].plot(mid,bands[:,7],'ko-',ms=3,label='Сумма')
+    axes[1].set(title='Составляющие момента относительно коуша',ylabel='Вклад в mz')
+    for ax in axes:
+        ax.axhline(0,color='.4',lw=.7)
+        ax.grid(alpha=.2)
+        ax.set_xlabel('x′ / R кромки — геометрическая координата')
+        ax.legend(fontsize=8)
+    fig.suptitle(f"Момент давления · α = {row.get('hold',0):g}° · парные грани: {100*coverage:.3f}% площади")
+    terms_plot=pics/'moment_pressure_terms.png'
+    fig.savefig(terms_plot,dpi=150);plt.close(fig)
+    return [str(meta),table,str(vtp_path),band_csv,half_csv,str(plot),str(terms_plot)],report
 
 
 def wake_cut(work,name,row,diameter,speed):
