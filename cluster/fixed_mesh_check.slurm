@@ -49,6 +49,8 @@ flags=dict(signature['physics']['flags'])
 for key in ['--mesh','--mesh-from','--all-passes','--attitude','--fixed-shape']:
     flags.pop(key,None)
 flags.update({'--fixed-shape':True,'--attitude':'legacy','--mesh-from':str(probe/'constant/polyMesh')})
+if record.get('coordinate_frame')=='nosarev_speed':
+    flags.update({'--seed-frame':'nosarev','--mesh-frame':'nosarev'})
 options=[key if value is True else key+'='+str(value) for key,value in flags.items() if value is not False]
 command=[sys.executable,str(b/'coupled/cs.py'),'nos6_held','0','0',str(iterations),'1',
          str(w/'input_shape.npy'),*options]

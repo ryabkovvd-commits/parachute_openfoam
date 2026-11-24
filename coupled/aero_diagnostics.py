@@ -1,7 +1,7 @@
 """Saved-field diagnostics: pressure loads, transfer conservation and wake cuts.
 
-No solver is started. Global OpenFOAM axes: flow +Z, side force +X, pitching
-moment +Y about the confluence. This module does not change CFD results.
+No solver is started. Axes follow each record: native (+Z,+X,+Y), or Nosarev
+speed (-X,+Y,+Z) for drag, side force and pitch about the confluence.
 """
 import csv
 import json
@@ -60,6 +60,12 @@ def pressure_folder(work, name, row):
 
 
 def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=None):
+    nosarev=row.get('coordinate_frame')=='nosarev_speed'
+    drag_axis=np.array([-1.,0.,0.]) if nosarev else np.array([0.,0.,1.])
+    side_axis=np.array([0.,1.,0.]) if nosarev else np.array([1.,0.,0.])
+    pitch_axis=np.array([0.,0.,1.]) if nosarev else np.array([0.,1.,0.])
+    term_keys=('xFy','minus_yFx') if nosarev else ('zFx','minus_xFz')
+    term_columns=('dmz_xFy','dmz_minus_yFx') if nosarev else ('dmz_zFx','dmz_minus_xFz')
     folder = pressure_folder(work,name,row)
     arrays = vtp.arrays
     common = arrays(folder/'master.vtp').keys() & arrays(folder/'slave.vtp').keys()
@@ -103,27 +109,29 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
     m_face,m_node = moments.sum(0),np.cross(mesh.position-anchor,load).sum(0)
     scale = q*area0*diameter
     relative = c-anchor
-    term_zfx = relative[:,2]*forces[:,0]/scale
-    term_minus_xfz = -relative[:,0]*forces[:,2]/scale
+    term_zfx = relative[:,0]*forces[:,1]/scale if nosarev else relative[:,2]*forces[:,0]/scale
+    term_minus_xfz = -relative[:,1]*forces[:,0]/scale if nosarev else -relative[:,0]*forces[:,2]/scale
+    pitch_values=moments@pitch_axis
     coverage = float(a[paired].sum()/a.sum())
     report = dict(pass_number=int(row['pass']),time=float(folder.name),pressure_field=field,
                   input_shape=str(shape),pair_tolerance_m=tolerance,
                   paired_area_fraction=coverage,unpaired_master_faces=int((~paired).sum()),
                   unpaired_slave_faces=int((~paired_slave).sum()),
                   pair_distance_max_m=float(distance.max()),
-                  moment_terms_paired_mz=dict(zFx=float(term_zfx[paired].sum()),
-                                             minus_xFz=float(term_minus_xfz[paired].sum())),
+                  moment_terms_paired_mz={term_keys[0]:float(term_zfx[paired].sum()),
+                                          term_keys[1]:float(term_minus_xfz[paired].sum())},
                   bank_pressure_note='Cp_master=p_master/(V^2/2), Cp_slave=p_slave/(V^2/2), using the solver zero-pressure reference. Patch names do not independently identify inside/outside at folds.',
                   face_force_N=f_face.tolist(),node_force_N=f_node.tolist(),
                   face_moment_Nm=m_face.tolist(),node_moment_Nm=m_node.tolist(),
                   paired_force_N=forces[paired].sum(0).tolist(),paired_moment_Nm=moments[paired].sum(0).tolist(),
                   force_transfer_relative=float(np.linalg.norm(f_face-f_node)/max(np.linalg.norm(f_face),1e-30)),
-                  moment_transfer_error_mz=float((m_node[1]-m_face[1])/scale),
+                  moment_transfer_error_mz=float((m_node-m_face)@pitch_axis/scale),
                   moment_transfer_error_vector_Nm=(m_node-m_face).tolist(),
-                  axes=dict(drag='+Z',side='+X',pitch='+Y',origin=anchor.tolist()),
+                  axes=dict(drag='-X' if nosarev else '+Z',side='+Y' if nosarev else '+X',
+                            pitch='+Z' if nosarev else '+Y',origin=anchor.tolist()),
                   note='Raw-nearest integration reproduces the current solver transfer. Paired-only values exclude unmatched faces; they are not the complete CFD load. Pressure loads exclude cord drag and viscous surface traction.')
-    for key,value,cord in [('cx',f_node[2]/(q*area0),'cord_cx'),
-                           ('cy',f_node[0]/(q*area0),'cord_cy'),('mz',m_node[1]/scale,'cord_mz')]:
+    for key,value,cord in [('cx',f_node@drag_axis/(q*area0),'cord_cx'),
+                           ('cy',f_node@side_axis/(q*area0),'cord_cy'),('mz',m_node@pitch_axis/scale,'cord_mz')]:
         report[key+'_pressure_recomputed'] = float(value)
         if key in row:
             report[key+'_pressure_from_history'] = float(row[key]-row.get(cord,0.))
@@ -150,7 +158,7 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
     exported = [dict(name='delta_Cp_master_minus_slave',kind='Float64',values=np.where(paired,delta,np.nan)),
                 dict(name='delta_p_Pa',kind='Float64',values=np.where(paired,delta*q,np.nan)),
                 dict(name='paired',kind='UInt8',values=paired.astype(int)),
-                dict(name='dmz_about_Y',kind='Float64',values=np.where(paired,moments[:,1]/scale,np.nan))]
+                dict(name='dmz_about_Z' if nosarev else 'dmz_about_Y',kind='Float64',values=np.where(paired,pitch_values/scale,np.nan))]
     for item in exported:
         entry = ET.SubElement(cells,'DataArray',type=item['kind'],Name=item['name'],format='ascii')
         entry.text = '\n'+' '.join(format(v,'.12g') for v in item['values'])+'\n'
@@ -158,6 +166,9 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
     tree.write(vtp_path,encoding='utf-8',xml_declaration=True)
     theta = np.radians(float(row.get('hold') or 0.))
     e1 = np.array([np.cos(theta),0.,-np.sin(theta)])
+    if nosarev:
+        from nosarev_frame import to_speed
+        e1=to_speed(e1)
     rim_centre = mesh.position[mesh.skirt].mean(0)
     x = (c-rim_centre)@e1
     half_width = max(float(np.max(np.abs((mesh.position[mesh.skirt]-rim_centre)@e1))),1e-12)
@@ -169,28 +180,28 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
         mask = paired & (xi>=left) & (xi<(right if right<bounds[-1] else right+1e-10))
         bands.append([left,right,int(mask.sum()),float(a[mask].sum()),
                       float(np.average(delta[mask],weights=a[mask])) if mask.any() else np.nan,
-                      float(forces[mask,2].sum()/(q*area0)),float(forces[mask,0].sum()/(q*area0)),
-                      float(moments[mask,1].sum()/scale),
+                      float(forces[mask].sum(0)@drag_axis/(q*area0)),float(forces[mask].sum(0)@side_axis/(q*area0)),
+                      float(pitch_values[mask].sum()/scale),
                       float(np.average(pm[mask]/kin,weights=a[mask])) if mask.any() else np.nan,
                       float(np.average(ps[forward[mask]]/kin,weights=a[mask])) if mask.any() else np.nan,
                       float(term_zfx[mask].sum()),float(term_minus_xfz[mask].sum())])
     bands = np.array(bands)
     band_csv = save_csv(out/f'moment_bands_pass{number:02d}.csv',
                        ['x_body_Rrim_min','x_body_Rrim_max','faces','area_m2','delta_Cp','dCx','dCy','dmz',
-                        'Cp_master','Cp_slave','dmz_zFx','dmz_minus_xFz'],bands)
+                        'Cp_master','Cp_slave',*term_columns],bands)
     halves=[]
     for label,selection in [('x_body_negative',xi<0),('x_body_nonnegative',xi>=0)]:
         mask=paired & selection
         mean=lambda values:float(np.average(values[mask],weights=a[mask])) if mask.any() else np.nan
         halves.append([label,float(a[mask].sum()),mean(pm/kin),mean(ps[forward]/kin),
                        mean(delta),float(term_zfx[mask].sum()),float(term_minus_xfz[mask].sum()),
-                       float(moments[mask,1].sum()/scale)])
+                       float(pitch_values[mask].sum()/scale)])
     half_csv=save_csv(out/f'moment_halves_pass{number:02d}.csv',
-                     ['half','area_m2','Cp_master','Cp_slave','delta_Cp','dmz_zFx','dmz_minus_xFz','dmz'],halves)
+                     ['half','area_m2','Cp_master','Cp_slave','delta_Cp',*term_columns,'dmz'],halves)
     fig,axes = plt.subplots(1,2,figsize=(11,4))
     mid = bands[:,:2].mean(1)
     axes[0].bar(mid,bands[:,7],width=np.diff(bounds)*.85,color=np.where(bands[:,7]>=0,'#2166ac','#b2182b'))
-    axes[0].set(title='Вклад участков купола в момент',ylabel='Δmz относительно коуша, ось +Y')
+    axes[0].set(title='Вклад участков купола в момент',ylabel='Δmz относительно коуша, ось '+('+Z' if nosarev else '+Y'))
     axes[1].plot(mid,np.cumsum(bands[:,7]),'o-',color='#333333',ms=4)
     axes[1].set(title='Накопленный момент давления',ylabel='Сумма Δmz')
     for ax in axes:
@@ -205,8 +216,10 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
         axes[0].plot(mid,bands[:,column],style,color=color,label=label)
     axes[0].set(title='Давление на двух берегах ткани',ylabel='Cp относительно нуля давления в решателе')
     width=np.diff(bounds)*.25
-    axes[1].bar(mid-width/2,bands[:,10],width=width,color='#066f93',label=r'$r_z\,dF_x/(qS_0D_0)$')
-    axes[1].bar(mid+width/2,bands[:,11],width=width,color='#a25418',hatch='//',label=r'$-r_x\,dF_z/(qS_0D_0)$')
+    axes[1].bar(mid-width/2,bands[:,10],width=width,color='#066f93',
+                label=r'$r_x\,dF_y/(qS_0D_0)$' if nosarev else r'$r_z\,dF_x/(qS_0D_0)$')
+    axes[1].bar(mid+width/2,bands[:,11],width=width,color='#a25418',hatch='//',
+                label=r'$-r_y\,dF_x/(qS_0D_0)$' if nosarev else r'$-r_x\,dF_z/(qS_0D_0)$')
     axes[1].plot(mid,bands[:,7],'ko-',ms=3,label='Сумма')
     axes[1].set(title='Составляющие момента относительно коуша',ylabel='Вклад в mz')
     for ax in axes:
@@ -221,6 +234,23 @@ def surface(work, name, row, diameter, speed, rho, pole='closed', vent_fraction=
 
 
 def wake_cut(work,name,row,diameter,speed):
+    if row.get('coordinate_frame')!='nosarev_speed':
+        return _wake_cut_material(work,name,row,diameter,speed)
+    from nosarev_view import material_view
+    with material_view(render=True):
+        paths=_wake_cut_material(work,name,row,diameter,speed)
+    path=work/'out/wake_cut.csv'
+    values=np.loadtxt(path,delimiter=',',skiprows=1,ndmin=2)
+    save_csv(path,['x_m','y_m','omega_z_D0_V'],np.c_[-values[:,1],-values[:,0],values[:,2]])
+    info_path=work/'out/wake_diagnostics.json'
+    info=json.loads(info_path.read_text(encoding='utf-8'))
+    info.update(coordinate_frame='nosarev_speed',omega_component='dUy/dx - dUx/dy',
+                reverse_flow_criterion='Ux > 0; imposed flow is -X')
+    info_path.write_text(json.dumps(info,indent=2),encoding='utf-8')
+    return paths
+
+
+def _wake_cut_material(work,name,row,diameter,speed):
     root = work/'fields'/name/f"pass{int(row['pass']):02d}"/'postProcessing/cut'
     candidates = [d/'plane.vtp' for d in pressure_table.numeric_dirs(root) if (d/'plane.vtp').is_file()]
     if not candidates:

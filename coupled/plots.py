@@ -68,6 +68,8 @@ FACES = None   # грани сетки на месте ткани -- «наст�
 PASS = FIELDS / f"pass{int(FLAG['--pass']):02d}" if "--pass" in FLAG else (passes[-1] if passes else None)
 story = OUT / f"{NAME}.json"
 HISTORY = json.loads(story.read_text(encoding="utf-8")) if story.is_file() else []
+if any(r.get('coordinate_frame')=='nosarev_speed' for r in HISTORY) and not globals().get('_NOSAREV_PLOT_ADAPTER'):
+    raise SystemExit('Nosarev global axes: use coupled/nosarev_plots.py with the same arguments')
 
 
 def last(folder):

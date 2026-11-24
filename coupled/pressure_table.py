@@ -228,7 +228,21 @@ def sample_patch(path, query, query_r, query_normal, centre, axis, meridian, arg
     return inside, (np.array(values)-args.p_inf)/(.5*velocity**2), np.array(distances), positive, rejected
 
 
-def extract(args, run):
+def extract(args,run):
+    row,_,_,_=locate(args,run)
+    if row.get('coordinate_frame')!='nosarev_speed':
+        return _extract_material(args,run)
+    from nosarev_view import material_view
+    from nosarev_frame import to_speed
+    with material_view():
+        result=_extract_material(args,run)
+    result.sampling[:,1:4]=to_speed(result.sampling[:,1:4])
+    result.metadata.update(coordinate_frame='nosarev_speed',
+        body_profile_frame='Intrinsic material meridian; positive transverse axis corresponds to -Y at alpha=0. Sampling query coordinates are global Nosarev x,y,z.')
+    return result
+
+
+def _extract_material(args, run):
     row, step, shape_path, velocity = locate(args, run)
     pos = np.load(shape_path, allow_pickle=False)
     g, r = int(row['gores']), int(row['rings'])

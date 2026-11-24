@@ -1,0 +1,73 @@
+{
+  "native": {
+    "cx": 0.5288560085587923,
+    "cy": 0.21079033305278597,
+    "mz": -0.07626402213735578
+  },
+  "nosarev": {
+    "cx": 0.5289172758175789,
+    "cy": -0.2107948376910894,
+    "mz": -0.07629019802842486
+  },
+  "covariance_error": {
+    "cx": 6.126725878652373e-05,
+    "cy": -4.5046383034264e-06,
+    "mz": -2.6175891069082913e-05
+  },
+  "scope": "Real OpenFOAM 2412; same frozen local canopy and 18465-cell mesh; 200 SIMPLE iterations, four ranks. This checks coordinate implementation, not grid/FSI convergence or experimental agreement.",
+  "native_solver_vectors": {
+    "force.dat": {
+      "native": [
+        723.202462,
+        2.64984811,
+        1729.59589
+      ],
+      "nosarev": [
+        -1729.79801,
+        -723.218091,
+        2.70507874
+      ],
+      "error": [
+        -0.20211999999992258,
+        -0.0156289999999899,
+        0.055230629999999614
+      ]
+    },
+    "moment.dat": {
+      "native": [
+        -8.70198383,
+        -654.08373,
+        3.83104669
+      ],
+      "nosarev": [
+        -3.90464493,
+        8.82873635,
+        -654.321322
+      ],
+      "error": [
+        -0.07359823999999993,
+        0.12675252000000015,
+        -0.2375920000000633
+      ]
+    }
+  },
+  "input_shape_sha256": "b5ddddf486ec6afe057e6ad8949cce399fd3a47228048b415173cbb90278ec81",
+  "parameters": {
+    "D0_m": 2.763953195770684,
+    "V_m_s": 30.0,
+    "rho_kg_m3": 1.225,
+    "nu_m2_s": 1.46e-05,
+    "fabric_D_m_s": 33.2,
+    "fabric_Cw": 28.6,
+    "cord_diameter_m": 0.0032,
+    "cord_Cd": 1.2,
+    "turbulence_length_m": 1.24,
+    "coordinate_map": "x=-Z_old; y=-X_old; z=Y_old"
+  },
+  "postprocessing": {
+    "paired_area_fraction": 1.0,
+    "standard_figures": "built",
+    "meridian": "blocked by same 97.5 percent orientation check in both frames; 99 percent required",
+    "confluence_load": "not a response in fixed-shape probe"
+  }
+}

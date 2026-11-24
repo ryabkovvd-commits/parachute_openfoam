@@ -186,11 +186,15 @@ def geometry_outputs(work,name,row,diameter,pole,vent_fraction):
     metrics = []
     theta = np.radians(float(row.get('hold') or 0.))
     e1,axis = np.array([np.cos(theta),0.,-np.sin(theta)]),np.array([np.sin(theta),0.,np.cos(theta)])
+    transverse=np.array([0.,1.,0.])
+    if row.get('coordinate_frame')=='nosarev_speed':
+        from nosarev_frame import to_speed
+        e1,axis,transverse=to_speed(np.array([e1,axis,transverse]))
     for state,position in [('last_cfd_input',mesh.position),('after_relaxation',final)]:
         skirt = position[mesh.skirt]
         centre = skirt.mean(0)
         canopy = position[:(mesh.rings+1)*mesh.gores]
-        metrics.append([state,np.ptp((skirt-centre)@e1)/diameter,np.ptp(skirt[:,1])/diameter,
+        metrics.append([state,np.ptp((skirt-centre)@e1)/diameter,np.ptp((skirt-centre)@transverse)/diameter,
                         np.max((canopy-centre)@axis)/diameter,np.ptp((skirt-centre)@axis)/diameter])
     artifacts.append(diagnostics.save_csv(work/'out/geometry_metrics.csv',
                      ['state','rim_width_xbody_D0','rim_width_y_D0','height_above_mean_rim_D0','rim_warp_D0'],metrics))
@@ -245,6 +249,9 @@ def _polar_locked(output,roots,name=NAME):
             errors.append(dict(case=str(work),error=str(error)))
     if not records:
         raise ValueError('No valid held-angle results found')
+    frames={r.get('coordinate_frame','native') for r in records}
+    if len(frames)>1:
+        raise ValueError('Mixed coordinate conventions: collect native and nosarev_speed series separately')
     records.sort(key=lambda r:(r['series'],r['angle'],r['case']))
     table = csv_records(output/'polar.csv',records,
                         ['angle','series','case','canopy_model','pass','status','cx','cy','mz','K','gap','cx_change'])
@@ -319,7 +326,7 @@ def case(work,args):
     report.stage('final_and_cfd_input_stl',lambda:geometry_outputs(work,args.name,row,diameter,args.pole,args.vent_fraction))
 
     def run_plots(gif=False):
-        script = Path(__file__).with_name('plots.py')
+        script = Path(__file__).with_name('nosarev_plots.py' if row.get('coordinate_frame')=='nosarev_speed' else 'plots.py')
         if not script.is_file():
             raise FileNotFoundError(script)
         command = [sys.executable,str(script),args.name,f'--run={work}',f'--V={speed:g}',f'--wake={args.wake}']
