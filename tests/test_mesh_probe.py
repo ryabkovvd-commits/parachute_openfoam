@@ -106,7 +106,7 @@ class MeshProbeTests(unittest.TestCase):
             code=script.split('<<\'PY\'\n')[1].split('\nPY\n')[0]
             def fake_run(command,cwd):
                 target=Path(cwd)/'case/constant/triSurface/canopy.stl'
-                target.parent.mkdir(parents=True)
+                target.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copyfile(Path(cwd)/'input_surface.stl',target)
                 return SimpleNamespace(returncode=0)
             with patch('subprocess.run',side_effect=fake_run) as solver:
@@ -123,6 +123,18 @@ class MeshProbeTests(unittest.TestCase):
             self.assertIn('--mesh-from='+str(probe/'constant/polyMesh'),command)
             result=json.loads((work/'fixed_mesh_input.json').read_text(encoding='utf-8'))
             self.assertEqual(result['input_stl_sha256'],digest)
+            self.assertEqual(result['CFD_iterations'],200)
+            with patch('subprocess.run',side_effect=fake_run) as solver:
+                with self.assertRaises(SystemExit) as done:
+                    execute(code,[SCRIPT.parents[1],probe,work,2000])
+            self.assertEqual(done.exception.code,0)
+            self.assertEqual(solver.call_args.args[0][5:7],['2000','1'])
+            result=json.loads((work/'fixed_mesh_input.json').read_text(encoding='utf-8'))
+            self.assertEqual(result['CFD_iterations'],2000)
+            with patch('subprocess.run') as solver:
+                with self.assertRaisesRegex(ValueError,'multiple of 200'):
+                    execute(code,[SCRIPT.parents[1],probe,work,201])
+                solver.assert_not_called()
             meta['copied_stl_sha256']='wrong'
             (probe/'mesh_probe.json').write_text(json.dumps(meta))
             with patch('subprocess.run') as solver:
