@@ -26,3 +26,5 @@ jobs:
       - run: bash -n cluster/fixed_shape_study.slurm
       - run: bash -n cluster/submit_fixed_shape_study.sh
       - run: bash -n cluster/collect_fixed_shape_study.slurm
+      - run: python -m py_compile cluster/extend_fixed_shape_study.py
+      - run: bash -n cluster/extend_fixed_shape_study.slurm && bash -n cluster/submit_extend_fixed_shape_study.sh
