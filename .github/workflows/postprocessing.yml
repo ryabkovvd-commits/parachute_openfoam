@@ -23,3 +23,6 @@ jobs:
       - run: bash -n cluster/fixed_mesh_check.slurm
       - run: bash -n cluster/nosarev_axes.slurm
       - run: bash -n cluster/nos6_held.slurm && bash -n cluster/nos6_wall.slurm && bash -n cluster/postprocess.slurm && bash -n cluster/permeability_models.slurm && bash -n cluster/momentum_balance.slurm
+      - run: bash -n cluster/fixed_shape_study.slurm
+      - run: bash -n cluster/submit_fixed_shape_study.sh
+      - run: bash -n cluster/collect_fixed_shape_study.slurm
