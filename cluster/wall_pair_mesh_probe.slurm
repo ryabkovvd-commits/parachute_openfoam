@@ -3,7 +3,6 @@
 #SBATCH -p compute1
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH --mem=16G
 #SBATCH --array=0-2%2
 #SBATCH -t 4:00:00
 #SBATCH -o %x-%A_%a.out
